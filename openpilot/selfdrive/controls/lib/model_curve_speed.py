@@ -8,6 +8,9 @@ Two layers decide how the car should accelerate through the curves the model pat
 * reaction -- the measured steering state (torque, tracking error) says what the car is doing right now: heavy but
   tracking, take the foot off (coast); pinned and understeering, brake to the speed that restores margin.
 
+Neither layer slows the car below the floor of the turn it is in (the owner's own pace through a right-angle turn): under it
+the steering is fighting the wheel angle, not the speed, and slowing further only makes the wheel heavier.
+
 The steering authority the anticipation counts on is calibrated online from the steering's own share of the lateral
 acceleration per unit of torque (the ground-plane value the torque controller reports, less the bank the limit adds back), measured
 only in real corners at speed and bounded around the torque tuning's own factor.
@@ -69,6 +72,20 @@ FAR_LIMIT_UNCERTAINTY = 0.25  # of the speed: a far limit this far under the car
 ROLL_HORIZON_S = 2.0          # s of travel over which the car's live roll still describes the road: farther path nodes get
                               # no bank either way. Route 0x4c: the approach's crown was charged to a node 143 m ahead that
                               # is banked the other way, and the limit there read 19.7 m/s instead of 25
+BANK_CONTINUATION_TOLERANCE = 0.25  # of the near path's curvature: a node beyond the horizon that curves the same way and no
+                              # more than this much harder is the bend the car is in, continuing, and keeps the bank the car is
+                              # measuring (in proportion to its curvature; a road's superelevation follows its curvature). In
+                              # every steady bend the strictest node sits just past the horizon (the commute bend: 53-55 m
+                              # against a 47-48 m horizon at 53 mph), so the bend was priced without its own bank: 2.2 deg
+                              # worth 2.6-4.5 mph of limit there, and route 0x19e t=1448-1451 held 35 mph at 0.3-0.57 torque
+                              # in a 6 deg bank whose far nodes read 42 mph with it (replay 36-45). A node tightening past the
+                              # tolerance, reversing, or seen from a straight keeps no bank, as before: the model under-reads a
+                              # tightening bend (0x19e t=1415: the apex at half its curvature until 80 m out) and a bank
+                              # credited to that read would compound it
+BANK_CONTINUATION_END = 0.3   # of the near path's curvature: a far node under this (or reversing) is where the bend ends, and no
+                              # node beyond it keeps the bank however it curves: a second bend behind a straight has a bank of its own
+BANK_CONTINUATION_MIN_LATERAL = 1.0  # m/s^2 of near-path lateral acceleration below which the car is not in a bend whose bank
+                              # could continue: the live roll is a crown or noise there
 
 # Anticipation.
 T_APPROACH = 1.5              # s, proportional approach to a limit that is near or already reached
@@ -93,6 +110,19 @@ BRAKE_EXIT_S = 0.5            # s, recovery must persist this long before the br
                               # own exit does: one sample at 0.19 among pinned 0.6 ones relaxed a -2.0 request to -1.1
 T_RESTORE = 1.0               # s, time in which the brake regime aims to restore the torque margin
 V_REACT_MIN = 3.0             # m/s, below this the reaction layer never brakes: measured curvature is noise there
+V_CURVE_FLOOR = 5.4           # m/s, the owner's own pace through a right-angle turn (12 mph): neither layer slows the car below
+                              # the floor of the turn it is in. The pin in sharp turns at walking pace is mostly the controller
+                              # driving the wheel against its angle (exit unwinds, the integrator frozen under 5 m/s), not a
+                              # speed the car cannot hold: over 23 routes 95 % of the 1-4 mph sharp-turn frames were pinned, 88 %
+                              # of those pushing against the turn; the into-the-turn share grows with speed (36 % at 9-13 mph).
+                              # The coast regime read the pin as heavy with no speed gate and could drag a 90-degree turn to a
+                              # stall (route 0x14b t=505: 0.67 m/s on a straight, torque 1.0, coasting). Under the floor the
+                              # policy has nothing to say, the brake regime included (holdout 0xa9 t=1459: its -0.7 at 11.9 mph
+                              # into a turn goes with it; the owner was on the gas within 0.5 s)
+A_FLOOR_LAT = 2.9             # m/s^2, the lateral acceleration the floor may ask of a turn: a hairpin the model cannot see
+                              # still slows below V_CURVE_FLOOR (R 5 m: 3.8 m/s). It is what the owner's 12 mph asks of a R 10 m
+                              # turn, 15 % under A_LAT_COMFORT (the ceiling) and above the rack's ~2.1 m/s^2 turn-in share at
+                              # speed; at 5.4 m/s the rack's hold is set by the wheel angle, and no engaged frame has measured it
 CURVE_GAS_GRACE_S = 5.0       # s after a driver gas override in which the anticipation may hold but never brake: the owner
                               # pushed past the curve's limit on purpose (route 0x2c t=885: the still-active episode pulled the
                               # exit back to -1.0 mid-corner after the pedal was released); the reaction brake regime still runs
@@ -185,6 +215,28 @@ def held_lateral(v_ego, held=AUTHORITY_HELD_LATERAL):
   return float(np.interp(v_ego, AUTHORITY_HELD_SPEED, (0.0, held)))
 
 
+def curve_floor(curvature):
+  """The speed below which the policy never slows the car for this curvature: the owner's pace in a right-angle turn, less
+  in a tighter one. A scalar gives a float, an array an array."""
+  floor = np.minimum(V_CURVE_FLOOR, np.sqrt(A_FLOOR_LAT / np.maximum(np.abs(curvature), MIN_CURVATURE)))
+  return float(floor) if np.ndim(floor) == 0 else floor
+
+
+def bank_continuation(signed_curvature, near, v_ego):
+  """Per node, the share of the live roll that describes the road there: all of it within the roll horizon, and beyond it
+  the bend the car is in continuing. A far node curving the same way no harder than the near path keeps the bank the car is
+  measuring, in proportion to its curvature; a node tightening past BANK_CONTINUATION_TOLERANCE, reversing, or seen from a
+  straight or a light bend keeps none, and nor does anything beyond the node where the bend ends: the bank there is unknown."""
+  weight = near.astype(float)
+  reference = float(np.mean(signed_curvature[near]))
+  if abs(reference) * v_ego ** 2 < BANK_CONTINUATION_MIN_LATERAL:
+    return weight
+  ratio = signed_curvature / reference
+  continuing = np.logical_and.accumulate(near | (ratio >= BANK_CONTINUATION_END))
+  weight = np.interp(ratio, (0.0, 1.0, 1.0 + BANK_CONTINUATION_TOLERANCE), (0.0, 1.0, 0.0))
+  return np.where(near, 1.0, np.where(continuing, weight, 0.0))
+
+
 def steering_share(state, bias):
   """The lateral acceleration the steering itself produces: the measured value less the bank and offset the limit adds back."""
   return abs(state.actual_lateral_accel - bias)
@@ -253,6 +305,7 @@ class ModelCurveSpeedLimiter:
     self._holding = False
     self._hold_s = 0.0
     self._open_s = 0.0
+    self._below_floor = False
 
   def _calibrated(self, params, state, v_ego, lateral_active, roll):
     # the torque tuning's factor is the prior; the measured ratio moves it inside AUTHORITY_BOUNDS while the steering
@@ -289,8 +342,10 @@ class ModelCurveSpeedLimiter:
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
     near = path_distance <= v_ego * ROLL_HORIZON_S
-    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active,
+    limits = curve_speed_limits(signed_curvature, params, roll * bank_continuation(signed_curvature, near, v_ego), lateral_active,
                                 held_lateral(v_ego, self.held_lateral))
+    # no node is priced below the floor of its own curvature: the policy never drives a turn slower than that
+    limits = np.maximum(limits, curve_floor(signed_curvature))
 
     # per node, the less demanding of the kinematic acceleration that meets its limit at its distance and a proportional
     # approach: far limits are kinematic, near or reached ones proportional, and the two meet continuously. Small and
@@ -322,6 +377,17 @@ class ModelCurveSpeedLimiter:
     heavy = state.torque >= T_COAST
     pinned = state.pinned or state.torque >= T_PIN
     understeer = state.understeer
+    # the curvature the car is in, from the steering's own lateral acceleration (the brake regime's read), and its floor
+    curvature_now = float(np.median(self._lateral_history)) / max(v_ego, V_REACT_MIN) ** 2
+    v_floor = curve_floor(curvature_now)
+    self._below_floor = v_ego < v_floor
+    if self._below_floor:
+      # under the floor the policy has nothing to say: no regime, no dwell carried over, and no hold armed by it (update)
+      self.regime = REGIME_FREE
+      self._losing_s = self._coast_enter_s = self._coast_exit_s = self._recovered_s = 0.0
+      return A_CURVE_FREE
+    # the most either regime may ask this close to the floor: the lift and the brake fade to zero at it instead of stepping off
+    floor_approach = min((v_floor - v_ego) / T_RESTORE, 0.0)
     if self.regime == REGIME_BRAKE:
       # recovery is tracking again or coming off the pin, and it must persist: one good sample in a pinned, understeering
       # stretch is not the car getting back inside its authority
@@ -347,12 +413,10 @@ class ModelCurveSpeedLimiter:
       # continuous in the torque: hold speed at the exit threshold, fully off the throttle at the coast threshold, so the
       # car settles where the steering is comfortably heavy instead of breathing between lift-off and free -- and never a
       # net acceleration while the steering is heavy, downhill included
-      return min(float(np.interp(state.torque, [T_COAST_EXIT, T_COAST], [0.0, accel_coast])), 0.0)
+      return max(min(float(np.interp(state.torque, [T_COAST_EXIT, T_COAST], [0.0, accel_coast])), 0.0), floor_approach)
     if self.regime == REGIME_BRAKE:
       # the speed at which the curvature the path demands fits back inside the budget, approached in T_RESTORE. The
       # demanded lateral acceleration, not the achieved one: a pinned car achieves less than the curve asks
-      lateral = float(np.median(self._lateral_history))
-      curvature_now = abs(lateral) / max(v_ego, V_REACT_MIN) ** 2
       if params is not None:
         factor, offset, friction = params
         bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
@@ -368,7 +432,7 @@ class ModelCurveSpeedLimiter:
       else:
         a_lat_ok = A_LAT_COMFORT
       v_ok = math.sqrt(a_lat_ok / max(curvature_now, MIN_CURVATURE))
-      return min(accel_coast, 0.0, (v_ok - v_ego) / T_RESTORE)
+      return max(min(accel_coast, 0.0, (v_ok - v_ego) / T_RESTORE), floor_approach)
     return A_CURVE_FREE
 
   def update(self, model, v_ego=0.0, a_ego=0.0, lateral_active=False, steering_pressed=False, roll=0.0, accel_coast=-0.3,
@@ -419,6 +483,14 @@ class ModelCurveSpeedLimiter:
     lifting = self.regime in (REGIME_COAST, REGIME_BRAKE)
     if steering:
       reaction = self._react(state, v_ego, accel_coast, params, roll)
+      if (state.torque >= T_COAST and not self._below_floor and self._gas_grace_s <= 0.0
+          and (anticipation < A_CURVE_FREE or self._output < A_CURVE_FREE)):
+        # the demand is never positive while the steering is heavy, dwell or not: a limit that rises mid-bend while the rack
+        # is at the coast threshold is not an invitation to accelerate into it for the 0.3 s before the coast takes over (the
+        # published value is jerk-limited from the car's own acceleration, so it comes down at J_DOWN). Only where a candidate
+        # already exists: a heavy frame on a straight has nothing to clamp and must not invent a candidate. Under the floor the
+        # heavy torque is the wheel angle's, and the owner's foot keeps its grace
+        reaction = min(reaction, 0.0)
     else:
       self.regime = REGIME_FREE
       self._losing_s = self._coast_enter_s = self._coast_exit_s = self._recovered_s = 0.0
@@ -428,8 +500,9 @@ class ModelCurveSpeedLimiter:
     # hold times out. A steering dropout arms it too (the regime falls to free) and keeps it for the resumption; the driver's
     # own steering or gas is never held. The anticipation reading free does not end it: the path sees the exit before the
     # car is through the bend, and a straight road reads open within the dwell anyway
-    if lifting and self.regime not in (REGIME_COAST, REGIME_BRAKE) and not self._holding:
-      # a lift inside a hold does not restart its clock: the backstop measures the whole hold
+    if lifting and self.regime not in (REGIME_COAST, REGIME_BRAKE) and not self._holding and not self._below_floor:
+      # a lift inside a hold does not restart its clock: the backstop measures the whole hold. A lift that ends because the
+      # car dropped under the floor is not the steering saying the bend is at its limit, and arms nothing
       self._holding = True
       self._hold_s = self._open_s = 0.0
     if self._holding:
@@ -437,7 +510,9 @@ class ModelCurveSpeedLimiter:
       self._open_s = self._open_s + self.dt if float(np.median(self._lateral_history)) < BEND_OPEN_A_LAT else 0.0
       if self._open_s + 1e-9 >= BEND_OPEN_S or self._hold_s + 1e-9 >= HOLD_MAX_S:
         self._holding = False
-    if self._holding and steering and self._gas_grace_s <= 0.0:
+    if self._holding and steering and self._gas_grace_s <= 0.0 and not self._below_floor:
+      # under the floor the hold lets the car come back up to it; it resumes above it for the rest of the bend (a dip under
+      # ~3.9 m/s in a R 10 m turn reads as the bend opening, and releases it)
       reaction = min(reaction, 0.0)
 
     raw = max(min(anticipation, reaction), A_CURVE_MIN)

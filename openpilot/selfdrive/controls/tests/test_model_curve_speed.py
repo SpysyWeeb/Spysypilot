@@ -7,8 +7,12 @@ import numpy as np
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
   A_CURVE_MIN,
+  A_FLOOR_LAT,
   A_LAT_COMFORT,
   AUTHORITY_BOUNDS,
+  BANK_CONTINUATION_END,
+  BANK_CONTINUATION_MIN_LATERAL,
+  BANK_CONTINUATION_TOLERANCE,
   AUTHORITY_HELD_LATERAL,
   AUTHORITY_HELD_SPEED,
   authority_margin,
@@ -32,6 +36,9 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   HOLD_MAX_S,
   T_APPROACH,
   T_COAST,
+  T_RESTORE,
+  V_CURVE_FLOOR,
+  V_REACT_MIN,
   AUTHORITY_MIN_TORQUE,
   FAR_NODE_DECEL_MAX,
   FAR_LIMIT_UNCERTAINTY,
@@ -39,14 +46,18 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   TORQUE_BUDGET,
   LateralState,
   ModelCurveSpeedLimiter,
+  bank_continuation,
+  curve_floor,
   curve_speed_limits,
 )
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
 T = np.array(ModelConstants.T_IDXS)
 FACTOR, FRICTION = 2.7, 0.11
 TORQUE = (FACTOR, 0.0, FRICTION)
+MODEL_MARGIN = (TORQUE_BUDGET - FRICTION) * FACTOR    # what the torque model prices the budget at, 2.13 m/s^2
 
 
 def make_model(speed=15.0, curvature=None, position_y=None):
@@ -680,3 +691,301 @@ class TestHold(unittest.TestCase):
     self.assertGreater(BEND_OPEN_A_LAT, 0.0)
     self.assertLess(0.0, BEND_OPEN_S)
     self.assertLess(BEND_OPEN_S, HOLD_MAX_S)
+
+
+class TestCurveFloor(unittest.TestCase):
+  # the floor under a turn: the owner's own pace through a right-angle turn, less in a hairpin; neither layer slows a turn below it
+
+  @staticmethod
+  def turning(v, k, ratio, torque, pinned):
+    # the steering in a turn of curvature k at speed v: asked k*v^2, delivering `ratio` of it at `torque`
+    desired = k * v * v
+    return LateralState(True, torque, desired * (1.0 - ratio), ratio * desired, desired, pinned)
+
+  def test_the_floor_is_the_owners_pace_in_a_right_angle_turn_and_lower_in_a_hairpin(self):
+    self.assertAlmostEqual(curve_floor(0.0), V_CURVE_FLOOR)                       # a straight: the speed floor alone
+    self.assertAlmostEqual(curve_floor(0.08), V_CURVE_FLOOR)                      # R 12.5 m, a right-angle street corner: 12 mph
+    self.assertAlmostEqual(curve_floor(0.10), math.sqrt(A_FLOOR_LAT / 0.10))      # R 10 m: 5.39, where the two terms meet
+    self.assertAlmostEqual(curve_floor(0.20), math.sqrt(A_FLOOR_LAT / 0.20))      # a R 5 m hairpin: 3.8, the lateral term
+    self.assertAlmostEqual(curve_floor(-0.20), curve_floor(0.20))
+    self.assertIsInstance(curve_floor(0.1), float)
+    np.testing.assert_allclose(curve_floor(np.array([0.0, 0.1, 0.4])),
+                               [V_CURVE_FLOOR, math.sqrt(A_FLOOR_LAT / 0.1), math.sqrt(A_FLOOR_LAT / 0.4)])
+    self.assertLess(A_FLOOR_LAT, A_LAT_COMFORT)                                   # comfort stays the ceiling over the floor
+    self.assertGreater(V_CURVE_FLOOR, V_REACT_MIN)                                # the curvature read keeps its own floor
+
+  def test_a_walking_pace_pin_on_a_straight_reads_free(self):
+    # route 0x14b t=505: 0.67 m/s on a straight, torque 1.0 against a desired of 0.017 m/s^2 (an exit unwind), error 0.016; the
+    # coast regime asked -0.23 there. Under the floor the reaction has nothing to say and arms no hold
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(0.67)
+    unwinding = LateralState(True, 1.0, 0.016, 0.002, 0.017, False)
+    for _ in range(round(3.0 / DT_MDL)):
+      result = limiter.update(straight, v_ego=0.67, a_ego=-0.6, lateral_active=True, accel_coast=-0.3, lateral_state=unwinding)
+      self.assertEqual(result.regime, REGIME_FREE)
+      self.assertIsNone(result.a_target)
+      self.assertFalse(result.holding)
+
+  def test_the_reaction_never_pulls_a_turn_below_its_floor_and_settles_there(self):
+    # a R 10 m turn entered at 6.5 m/s with the steering pinned and losing the line: the brake regime engages above the floor
+    # and the car, following the candidate, settles at the floor (5.39 m/s) instead of being pulled toward 2.9. Under the floor
+    # the regime is free and the candidate never negative
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    k, v, a = 0.10, 6.5, 0.0
+    floor = curve_floor(k)
+    regimes, speeds = [], []
+    for _ in range(round(12.0 / DT_MDL)):
+      result = limiter.update(make_model(v, np.full(N, k)), v_ego=v, a_ego=a, lateral_active=True, accel_coast=-0.3,
+                              lateral_state=self.turning(v, k, 0.8, 1.0, True))
+      regimes.append(result.regime)
+      a = result.a_target if result.a_target is not None else 0.0
+      if v < floor - 0.02:
+        self.assertNotIn(result.regime, (REGIME_COAST, REGIME_BRAKE))
+        self.assertGreaterEqual(a, 0.0)
+      v = max(v + a * DT_MDL, 0.0)
+      speeds.append(v)
+    self.assertIn(REGIME_BRAKE, regimes)
+    self.assertGreaterEqual(min(speeds), floor - 0.05)
+    self.assertAlmostEqual(speeds[-1], floor, delta=0.05)
+
+  def _fade(self, regime, ratio, torque, pinned):
+    # heavy but tracking (coast) or pinned and losing (brake), swept down through the floor of a R 10 m turn at 0.01 m/s a frame
+    # on a straight path (the reaction alone): the request never deepens past the approach to the floor, shrinks to zero at it
+    # and is gone under it, where the regime is free and no hold is armed. The hand-back is the module's own ramp, not a step
+    k, floor, step = 0.10, curve_floor(0.10), 0.01
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(floor + 0.6)
+
+    def frame(v):
+      return limiter.update(straight, v_ego=v, a_ego=-0.2, lateral_active=True, accel_coast=-0.3,
+                            lateral_state=self.turning(v, k, ratio, torque, pinned))
+    result = None
+    for _ in range(round(1.0 / DT_MDL)):
+      result = frame(floor + 0.6)
+    self.assertEqual(result.regime, regime)
+    trace = []
+    for v in np.arange(floor + 0.6, floor - 0.2, -step):
+      result = frame(float(v))
+      trace.append((float(v), result.a_target, result.regime, result.holding))
+    requests = [a if a is not None else 0.0 for _, a, _, _ in trace]
+    self.assertLessEqual(max(abs(x - y) for x, y in zip(requests[1:], requests[:-1], strict=True)), J_UP * DT_MDL + 3 * step)
+    # the curvature read is the median of the last three lateral samples over the current speed squared, so on a slowing car
+    # the floor reads a few mm/s low: the frames within 2 cm/s of it are the crossing
+    for v, a, reg, holding in trace:
+      self.assertFalse(holding, v)
+      if v >= floor + 2 * step:
+        self.assertEqual(reg, regime, v)
+        self.assertLessEqual(a, 0.0, v)
+        self.assertGreaterEqual(a, (floor - v) / T_RESTORE - 2 * step, v)        # never deeper than the approach to the floor
+      elif v <= floor - 2 * step:
+        self.assertEqual(reg, REGIME_FREE, v)
+        self.assertTrue(a is None or a >= 0.0, v)
+    above = [a for v, a, _, _ in trace if v >= floor]
+    self.assertLess(abs(above[-1]), 3 * step)                                    # about zero when the regime lets go
+    self.assertLessEqual(above[0], -0.3 + 1e-9)                                  # a real request before the fade
+
+  def test_the_lift_fades_to_zero_at_the_floor_without_a_step(self):
+    self._fade(REGIME_COAST, ratio=0.97, torque=0.9, pinned=False)
+
+  def test_the_brake_fades_to_zero_at_the_floor_without_a_step(self):
+    self._fade(REGIME_BRAKE, ratio=0.8, torque=1.0, pinned=True)
+
+  def test_a_hold_lets_the_car_back_up_to_the_floor_and_resumes_above_it(self):
+    # a lift at 8 m/s in a bend ends into a hold with the bend still on. Slowed under the floor by something else, the car is
+    # free to come back up to it; above it the hold clamps again until the bend reads open
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(8.0)
+    settle(limiter, straight, round(COAST_ENTER_S / DT_MDL) + 4, v_ego=8.0, lateral_active=True, accel_coast=-0.3,
+           lateral_state=tracking(torque=0.9, error=0.1, lat=2.0))
+    self.assertEqual(limiter.regime, REGIME_COAST)
+    held = settle(limiter, straight, round(COAST_EXIT_S / DT_MDL) + 4, v_ego=8.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=2.0))
+    self.assertTrue(held.holding)
+    self.assertEqual(held.a_target, 0.0)
+    under = [limiter.update(straight, v_ego=5.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=2.0))
+             for _ in range(round(A_CURVE_FREE / J_UP / DT_MDL) + 2)]
+    self.assertTrue(all(r.holding for r in under))                               # the hold is kept ...
+    self.assertTrue(all(r.a_target is None or r.a_target > 0.0 for r in under))  # ... but under the floor its clamp ramps out ...
+    self.assertIsNone(under[-1].a_target)                                        # ... and is gone
+    back = settle(limiter, straight, 2, v_ego=6.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=2.0))
+    self.assertTrue(back.holding)
+    self.assertEqual(back.a_target, 0.0)                                         # above it the clamp is back at once
+    opened = settle(limiter, straight, round(BEND_OPEN_S / DT_MDL) + 2, v_ego=6.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
+    self.assertFalse(opened.holding)
+
+  def test_a_dwell_does_not_carry_across_the_floor(self):
+    # heavy for most of the coast dwell above the floor, one frame under it, heavy again above it: the dwell starts over, so the
+    # crossing cannot complete a lift the steering has not asked for continuously. R 17 m, where the floor is the 5.4 m/s term
+    # whatever the lateral read's lag says
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight, k = make_model(6.0), 0.06
+    frames = round(COAST_ENTER_S / DT_MDL)
+    for _ in range(frames - 1):
+      result = limiter.update(straight, v_ego=6.0, lateral_active=True, lateral_state=self.turning(6.0, k, 0.97, 0.9, False))
+    self.assertNotEqual(result.regime, REGIME_COAST)
+    limiter.update(straight, v_ego=5.0, lateral_active=True, lateral_state=self.turning(5.0, k, 0.97, 0.9, False))
+    for i in range(frames - 1):
+      result = limiter.update(straight, v_ego=6.0, lateral_active=True, lateral_state=self.turning(6.0, k, 0.97, 0.9, False))
+      self.assertNotEqual(result.regime, REGIME_COAST, i)
+    result = limiter.update(straight, v_ego=6.0, lateral_active=True, lateral_state=self.turning(6.0, k, 0.97, 0.9, False))
+    self.assertEqual(result.regime, REGIME_COAST)
+
+  def test_a_hairpin_the_model_sees_is_priced_at_its_own_floor(self):
+    # R 5 m: the torque model says 3.27 m/s, comfort 4.12; the floor is the lateral term, 3.81, not the 5.4 of a right-angle turn
+    result = settle(ModelCurveSpeedLimiter(make_cp()), make_model(5.0, np.full(N, 0.20)), 5, v_ego=5.0, lateral_active=True, lateral_state=tracking())
+    self.assertAlmostEqual(result.v_limit, math.sqrt(A_FLOOR_LAT / 0.20), places=6)
+    self.assertLess(result.v_limit, V_CURVE_FLOOR)
+
+  def test_the_anticipation_prices_no_node_below_the_floor_and_leaves_the_road_above_it_alone(self):
+    # in town (no demonstrated hold) the torque model priced a R 10 m node at 4.62 m/s; it reads the floor, 5.39. A R 50 m node
+    # (10.3) and a highway sweeper are untouched, and so is the per-node pricing itself
+    for k, expect in ((0.10, curve_floor(0.10)), (0.02, math.sqrt(MODEL_MARGIN / 0.02))):
+      for v in (4.0, 6.0):
+        result = settle(ModelCurveSpeedLimiter(make_cp()), make_model(v, np.full(N, k)), 5, v_ego=v, lateral_active=True, lateral_state=tracking())
+        self.assertAlmostEqual(result.v_limit, expect, places=6, msg=(k, v))
+    highway = settle(ModelCurveSpeedLimiter(make_cp()), make_model(25.0, np.full(N, 0.005)), 5, v_ego=25.0, lateral_active=True, lateral_state=tracking())
+    self.assertAlmostEqual(highway.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / 0.005), places=4)
+    self.assertAlmostEqual(float(curve_speed_limits(np.array([0.10]), TORQUE, 0.0)[0]), math.sqrt(MODEL_MARGIN / 0.10))
+
+
+class TestBankContinuation(unittest.TestCase):
+  # beyond the roll horizon, the bend the car is in keeps the bank the car is measuring; anything else there is bank-blind as before
+  V = 24.0
+
+  def near(self):
+    return self.V * T <= self.V * ROLL_HORIZON_S
+
+  def test_a_far_node_of_the_bend_the_car_is_in_keeps_the_banks_share_in_proportion(self):
+    near, v = self.near(), self.V
+    same = np.full(N, 0.005)                                                     # one R 200 m bend, continuing
+    np.testing.assert_allclose(bank_continuation(same, near, v), 1.0)
+    opening = np.where(near, 0.005, 0.0025)                                      # opening to R 400 m: half the bank
+    np.testing.assert_allclose(bank_continuation(opening, near, v)[~near], 0.5)
+    tightening = np.where(near, 0.005, 0.005 * (1.0 + BANK_CONTINUATION_TOLERANCE / 2))
+    np.testing.assert_allclose(bank_continuation(tightening, near, v)[~near], 0.5)   # half way into the tolerance: half
+    past = np.where(near, 0.005, 0.005 * (1.0 + BANK_CONTINUATION_TOLERANCE))
+    np.testing.assert_allclose(bank_continuation(past, near, v)[~near], 0.0)
+    reversing = np.where(near, 0.005, -0.005)                                     # the second half of an S
+    np.testing.assert_allclose(bank_continuation(reversing, near, v)[~near], 0.0)
+    np.testing.assert_allclose(bank_continuation(reversing, near, v)[near], 1.0)  # the near nodes keep the live roll regardless
+
+  def test_a_straight_or_a_light_bend_lends_its_roll_to_nothing_beyond_the_horizon(self):
+    near, v = self.near(), self.V
+    light = np.full(N, 0.9 * BANK_CONTINUATION_MIN_LATERAL / v ** 2)             # under 1 m/s^2 near the car: the roll is a crown
+    np.testing.assert_allclose(bank_continuation(light, near, v)[~near], 0.0)
+    np.testing.assert_allclose(bank_continuation(light, near, v)[near], 1.0)
+    approach = np.where(near, 0.0, 0.006)                                        # a bend ahead seen from a straight: as before
+    np.testing.assert_allclose(bank_continuation(approach, near, v)[~near], 0.0)
+    loaded = np.full(N, 1.01 * BANK_CONTINUATION_MIN_LATERAL / v ** 2)           # just over it: the bend's own far nodes keep it
+    np.testing.assert_allclose(bank_continuation(loaded, near, v)[~near], 1.0)
+
+  def test_a_bend_of_its_own_behind_a_straight_keeps_no_bank(self):
+    # the bend the car is in ends in a straight 60 m out, and another bend the same way follows: the first bend's bank says
+    # nothing about the second, so the second is priced bank-blind and, being the strictest, sets the limit
+    v, k, roll = self.V, 0.005, 0.04
+    x = v * T
+    near = self.near()
+    gap = (x >= 60.0) & (x < 100.0)
+    path = np.where(gap, BANK_CONTINUATION_END * k / 2, k)                        # the gap curves the same way, under the end mark
+    weights = bank_continuation(path, near, v)
+    np.testing.assert_allclose(weights[gap | (x >= 100.0)], 0.0)
+    np.testing.assert_allclose(weights[near], 1.0)
+    result = settle(ModelCurveSpeedLimiter(make_cp()), make_model(v, path), 3, v_ego=v, lateral_active=True, roll=roll, lateral_state=tracking())
+    self.assertAlmostEqual(result.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / k), places=4)
+    self.assertGreater(result.distance, 100.0)
+
+  def test_the_reference_is_the_near_paths_mean_not_its_tightest_node(self):
+    # the near path tightening from R 500 to R 250 m, the far nodes at R 222 m: against the mean (R 333) that is 50 % tighter and
+    # keeps no bank; against the tightest near node it would be 12 % tighter and keep half of it
+    v, roll = self.V, 0.04
+    x = v * T
+    near = self.near()
+    graded = np.where(near, 0.002 + 0.002 * x / (v * ROLL_HORIZON_S), 0.0045)
+    np.testing.assert_allclose(bank_continuation(graded, near, v)[~near], 0.0)
+    result = settle(ModelCurveSpeedLimiter(make_cp()), make_model(v, graded), 3, v_ego=v, lateral_active=True, roll=roll, lateral_state=tracking())
+    self.assertAlmostEqual(result.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / 0.0045), places=4)
+
+  def test_an_adverse_roll_is_charged_to_the_bend_beyond_the_horizon(self):
+    # the bend continuing 20 % tighter with the car on a crown against it: the far node keeps a fifth of the adverse roll, so its
+    # limit is lower than bank-blind, never higher
+    v, roll = self.V, -0.04
+    near = self.near()
+    model = make_model(v, np.where(near, 0.004, 0.0048))
+    charged = settle(ModelCurveSpeedLimiter(make_cp()), model, 3, v_ego=v, lateral_active=True, roll=roll, lateral_state=tracking())
+    weight = float(np.interp(1.2, (0.0, 1.0, 1.0 + BANK_CONTINUATION_TOLERANCE), (0.0, 1.0, 0.0)))
+    self.assertAlmostEqual(charged.v_limit, math.sqrt((AUTHORITY_HELD_LATERAL + weight * roll * ACCELERATION_DUE_TO_GRAVITY) / 0.0048), places=4)
+    self.assertLess(charged.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / 0.0048))
+
+  def test_a_steady_banked_bend_is_priced_with_its_bank_beyond_the_horizon(self):
+    # one R 200 m bend at 24 m/s banked 2.3 deg in its favour (the commute bend): its strictest node sits past the 2 s horizon
+    # and used to be priced without the bank; it now reads as the near nodes do. A crown against the turn is charged there too
+    v, k, roll = self.V, 0.005, 0.04
+    bend = make_model(v, np.full(N, k))
+    limits = {r: settle(ModelCurveSpeedLimiter(make_cp()), bend, 3, v_ego=v, lateral_active=True, roll=r, lateral_state=tracking()).v_limit
+              for r in (roll, 0.0, -roll)}
+    g = ACCELERATION_DUE_TO_GRAVITY
+    self.assertAlmostEqual(limits[0.0], math.sqrt(AUTHORITY_HELD_LATERAL / k), places=4)
+    self.assertAlmostEqual(limits[roll], math.sqrt((AUTHORITY_HELD_LATERAL + roll * g) / k), places=4)
+    self.assertAlmostEqual(limits[-roll], math.sqrt((AUTHORITY_HELD_LATERAL - roll * g) / k), places=4)
+
+  def test_a_tightening_bend_ahead_keeps_no_bank_it_has_not_shown(self):
+    # route 0x19e t=1415: a right-hander banked in its favour that the model read at half its curvature until 80 m out. With the
+    # near path in the gentle part and the far nodes tightening past the tolerance, those are priced bank-blind, as before
+    v, roll = self.V, 0.06
+    near = self.near()
+    model = make_model(v, np.where(near, 0.004, 0.004 * 1.6))
+    banked = settle(ModelCurveSpeedLimiter(make_cp()), model, 3, v_ego=v, lateral_active=True, roll=roll, lateral_state=tracking())
+    level = settle(ModelCurveSpeedLimiter(make_cp()), model, 3, v_ego=v, lateral_active=True, roll=0.0, lateral_state=tracking())
+    self.assertAlmostEqual(banked.v_limit, level.v_limit, places=6)
+    self.assertAlmostEqual(banked.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / (0.004 * 1.6)), places=4)
+    self.assertAlmostEqual(banked.a_target, level.a_target, places=6)
+
+  def test_the_bank_fades_out_as_the_bend_ahead_tightens(self):
+    # between the near path's curvature and the tolerance the credit is continuous, so a bend read a little tighter ahead lowers
+    # the limit smoothly instead of flipping it between banked and bank-blind
+    v, roll = self.V, 0.04
+    near = self.near()
+    limits = [settle(ModelCurveSpeedLimiter(make_cp()), make_model(v, np.where(near, 0.005, 0.005 * ratio)), 3, v_ego=v, lateral_active=True,
+                     roll=roll, lateral_state=tracking()).v_limit for ratio in np.linspace(1.0, 1.0 + BANK_CONTINUATION_TOLERANCE, 6)]
+    self.assertAlmostEqual(limits[0], math.sqrt((AUTHORITY_HELD_LATERAL + roll * ACCELERATION_DUE_TO_GRAVITY) / 0.005), places=4)
+    self.assertAlmostEqual(limits[-1], math.sqrt(AUTHORITY_HELD_LATERAL / (0.005 * (1.0 + BANK_CONTINUATION_TOLERANCE))), places=4)
+    steps = [a - b for a, b in zip(limits[:-1], limits[1:], strict=True)]
+    self.assertGreaterEqual(min(steps), -1e-9)                                     # monotone: tighter and less bank both lower it
+    self.assertLess(max(steps), 1.2)                                               # 5 % tighter is never a jump
+
+  def test_the_demand_is_never_positive_while_the_steering_is_heavy_dwell_or_not(self):
+    # a limit above the car wants a small acceleration; with the torque at the coast threshold for one frame the demand is clamped
+    # to zero at once, not after the coast's dwell (the 2026-10-31 package replay saw +0.5 through it on 0x185). Below the
+    # threshold the candidate stays positive
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    bend = make_model(15.0, np.full(N, TestHold.CURVATURE))
+    light = settle(limiter, bend, 3, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, error=0.1, lat=2.0))
+    self.assertGreater(light.a_target, 0.0)
+    firm = limiter.update(bend, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=T_COAST - 0.05, error=0.1, lat=2.0))
+    self.assertGreater(firm.a_target, 0.0)
+    heavy = limiter.update(bend, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertNotEqual(heavy.regime, REGIME_COAST)                              # the dwell has not elapsed ...
+    self.assertLessEqual(heavy.a_target, 0.0)                                      # ... and the candidate is already not positive
+
+  def test_a_heavy_frame_on_a_straight_has_nothing_to_clamp(self):
+    # with no candidate the guard must not invent one: a torque blip on a straight, or a torque breathing around the threshold
+    # so the dwell never completes, publishes nothing
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(20.0)
+    for torque in (0.9, 0.5, 0.5):
+      self.assertIsNone(limiter.update(straight, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=torque, lat=1.2)).a_target)
+    for i in range(60):
+      result = limiter.update(straight, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=(0.80, 0.86)[i % 2], lat=1.2))
+      self.assertIsNone(result.a_target, i)
+      self.assertEqual(result.regime, REGIME_FREE, i)
+
+  def test_the_owners_foot_keeps_its_grace_from_the_guard(self):
+    # the 5 s after a gas override: the anticipation may hold but never brake, and heavy steering does not clamp the owner's speed
+    # inside the grace; a fresh limiter in the same frame does
+    bend = make_model(15.0, np.full(N, TestHold.CURVATURE))
+    graced = ModelCurveSpeedLimiter(make_cp())
+    settle(graced, bend, 3, v_ego=15.0, lateral_active=True, gas_pressed=True, lateral_state=tracking(torque=0.5, error=0.1, lat=2.0))
+    inside = graced.update(bend, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertGreater(inside.a_target, 0.0)
+    plain = ModelCurveSpeedLimiter(make_cp())
+    settle(plain, bend, 3, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, error=0.1, lat=2.0))
+    self.assertLessEqual(plain.update(bend, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0)).a_target, 0.0)

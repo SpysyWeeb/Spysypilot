@@ -53,6 +53,11 @@ Every model path node gets a curvature (yaw rate ÷ speed, 3-node spatial median
 - **comfort** — `v² = A_LAT_COMFORT / κ` with `A_LAT_COMFORT = 3.4 m/s²`, above the owner's measured manual turns.
   The calibrated steering authority normally binds first; comfort remains the ceiling if the learned authority grows.
 
+The roll in the authority limit is the live one for nodes within `ROLL_HORIZON_S` (2 s of travel). Beyond it a node of the
+bend the car is in — same sign, no more than `BANK_CONTINUATION_TOLERANCE` (25 %) tighter than the near path, the near path
+loaded by at least 1 m/s² — keeps the live roll in proportion to its curvature; every other far node gets none (2026-11-01).
+No node is priced below `curve_floor(κ)` (below).
+
 Per node the candidate is the less demanding of the kinematic acceleration that meets the limit at its distance and a
 proportional approach `(v_limit − v)/T_APPROACH`; the strictest node wins. That is small and positive near a limit
 (no burst toward it), zero at it, and the needed deceleration beyond it. It is floored at `A_CURVE_MIN` (−2.0: harder
@@ -78,9 +83,13 @@ actual and desired lateral acceleration, saturated / torque-limited. Only while 
   while the driver's wheel, a lateral dropout or a disengagement end it at once. Never below
   `V_REACT_MIN` (3 m/s), where the measured curvature is noise.
 - **free** otherwise. Regimes are dwelled at every edge; a single sample never switches them.
+- **the floor** — below `curve_floor(κ_now) = min(V_CURVE_FLOOR 5.4 m/s, sqrt(A_FLOOR_LAT 2.9 / κ_now))` of the curvature the
+  steering measures (12 mph in a right-angle turn, less in a hairpin) the reaction is free, arms no hold and suspends an
+  existing hold's clamp; above it the lift and the brake fade to zero at the floor (2026-11-01).
 
-The final candidate is `max(min(anticipation, reaction), A_CURVE_MIN)`, jerk-limited as one signal, and absent
-(`None`) whenever it would not bind or is not finite. The planner adds it only while engaged (`not reset_state`).
+The final candidate is `max(min(anticipation, reaction), A_CURVE_MIN)`, jerk-limited as one signal, never positive while the
+steering is heavy (torque ≥ `T_COAST`, dwell or not), and absent (`None`) whenever it would not bind or is not finite. The
+planner adds it only while engaged (`not reset_state`).
 
 ## Why (field evidence, 2026-08-29, routes 22–26)
 Steering pinned (≥ 0.95) 8.4 s in ~2 min of engaged turning, tracking ~75 % of that time. The old limiter's predicted
@@ -91,6 +100,11 @@ always-on lateral with the steering at 0.45–0.9 torque and error ≤ 0.3 while
 
 ## Validation
 - `test_model_curve_speed.py`: limits, kinematic/proportional candidate, spikes and invalid models, jerk limits and floor,
+  `TestCurveFloor` (the floor's values, the walking-pace pin, the closed-loop settle at the floor, the coast and brake fades,
+  the hold under the floor, the dwell across it, the anticipation's floored nodes) and `TestBankContinuation` (the weights,
+  a steady banked bend, a tightening bend, an opening one, a bend behind a straight, the mean reference, an adverse far
+  roll, the heavy guard; 2026-11-01). The planner-level tests and the maneuver plant were not run on the host for the
+  2026-11-01 change (no `libparams_c.so` / MPC build there).
   coast/brake dwell and hysteresis, understeer sign, both lateral state kinds, authority calibration and bounds, the
   candidate never raising the plan, and a guard that the legacy veto/cap surface is gone from the planner.
 - `test_longitudinal.py::TestCurvePolicy`: the maneuver plant gained a world-fixed curve with a synthetic torque state
@@ -169,7 +183,8 @@ measured by running the limit function on the recorded path:
 
 * **the live roll was applied to every path node** — the approach's crown (+0.044 rad, real) charged against a node banked
   the other way, worth 2–5 m/s of limit there. Nodes farther than `ROLL_HORIZON_S` (2 s of travel) now get no roll either
-  way; the near nodes keep the live value, and the brake regime now charges the bank by the turn's sign too (it had
+  way (amended 2026-11-01: except the bend the car is in, continuing, which keeps the live roll beyond the horizon);
+  the near nodes keep the live value, and the brake regime now charges the bank by the turn's sign too (it had
   used the magnitude, so a crown against the turn was credited as help). Replay: 0x4c's candidate minimum −1.79 → −1.34 and the
   brake starts 10 m later; 0x4d unchanged.
 * **the online authority factor drifted with the last road driven** — 2.33 carried into 0x4c from town corners 300 s
@@ -198,8 +213,9 @@ from the left line and the owner adding torque. The rack could hold about 24.5 m
   approach moves from 2827.3 to 2824.6.
 * **A node beyond the roll horizon whose shortfall a bank could explain asks for a moderate deceleration at most**
   (`FAR_NODE_DECEL_MAX` 1.0 m/s², for far limits within `FAR_LIMIT_UNCERTAINTY` 25 % of the car's speed; a far bend well
-  under that keeps its full deceleration). With an honest factor, a banked sweeper read without its bank is 10–15 % too
-  slow: route 0x4d's far limit came out at 20.7 m/s for a bend the rack held at 24, and the kinematic candidate hit the
+  under that keeps its full deceleration; since 2026-11-01 a far node of the bend the car is in carries the live bank, so
+  the doubt there is smaller, and the cap still applies). With an honest factor, a banked sweeper read without its bank is
+  10–15 % too slow: route 0x4d's far limit came out at 20.7 m/s for a bend the rack held at 24, and the kinematic candidate hit the
   −2.0 floor five seconds out. A cap of 0.5 left that car 4 m/s over at the horizon and the floor still came; at 1.0 the
   early, moderate deceleration sheds the doubt-sized shortfall before the node comes within the horizon, where the bank
   is the car's own and the hard brake is allowed.
@@ -294,3 +310,64 @@ An audit of 30f6c55d2 reproduced four defects; all four are fixed.
 The policy's decision is logged every model frame as `curvePolicyState`: `custom.capnp`'s `CustomReserved1` renamed, the
 schema's own convention for forks (combo's `SpysydriveStateSP` holds slot 0). It carries the regime, whether the candidate
 is active, its acceleration, the strictest node's limit and distance, the authority factor and the hold.
+
+## 2026-11-01 — the bend's own bank beyond the horizon, and a floor under the turn
+
+Two findings from the 2026-10-31/11-01 route study (`~/Documents/spysypilot-route-audit/curve_midcorner_2026-10-31/REPORT.md`,
+sections 6, 9 and 11; 49 earlier routes plus 18 new ones), each fixed here. Nothing else in the policy changed.
+
+**The steady bend was priced without its own bank.** Since 2026-09-04 a path node beyond `ROLL_HORIZON_S` (2 s of travel) got
+no roll, because the live roll describes the road under the car, not a bend 143 m ahead banked the other way. But in every
+steady bend the strictest node sits just past that horizon — on the commute bend 53–55 m out against a 47–48 m horizon at 53
+mph — so the bend the car was already in was priced bank-blind: 2.2° of favourable bank, worth about 3 mph there. Route 0x19e
+t=1448–1451 is the clear case: a 5° banked bend held at 34.5 mph with the rack at 0.3–0.57 torque while the owner accelerated
+out; the far nodes priced with the bank read 38–42 mph. `bank_continuation()` now gives a far node the live roll when it is the
+same bend continuing: same sign of curvature, no more than `BANK_CONTINUATION_TOLERANCE` (25 %) tighter than the mean of the
+near nodes, in proportion to its curvature when it opens (a road's superelevation follows its curvature), and only while the
+near path is loaded by at least `BANK_CONTINUATION_MIN_LATERAL` (1 m/s²), so a crown on a straight lends nothing. An adverse
+live roll is charged to those nodes the same way. The tightening test is the safety of it: the model under-reads a tightening
+bend (0x19e t=1415, the apex at half its curvature until 80 m out, REPORT s.11), and a bank credited to that read would compound
+it. On that bend the credit stays at zero through the approach and appears only once the near path is itself in the tight part,
+where the nodes within the horizon were already banked. The 2.8 m/s² held floor of the 10-31 package replay (REPORT s.9) was
+rejected for exactly that bend; this change lifts the limit only where a bank is measured, and not for a bend that tightens ahead.
+
+**Sharp turns could be dragged toward a stall.** At walking pace the torque in a sharp turn is mostly the controller driving
+the wheel against its angle — exit unwinds, the integrator frozen under 5 m/s — not a load the speed sets: over 23 routes 95 %
+of the 1–4 mph sharp-turn frames were pinned, 88 % of them with the torque pushing against the turn (REPORT s.6). The coast
+regime read that as heavy, had no speed gate, and could hold the throttle shut until the wheel came back: route 0x14b t=505
+coasted at 0.67 m/s on a straight. The brake regime cannot drag to zero (it exits at ~2.9 m/s), but in a long pinned arc the
+coast could. `curve_floor(κ) = min(V_CURVE_FLOOR, sqrt(A_FLOOR_LAT / κ))` is the speed below which the policy has nothing to
+say for that curvature: `V_CURVE_FLOOR` 5.4 m/s is the owner's own pace through a right-angle turn (12 mph), `A_FLOOR_LAT` 2.9
+m/s² is what that pace asks of a R 10 m turn, so a hairpin the model cannot see still slows (R 5 m: 3.8 m/s) and comfort stays
+the ceiling above the floor. Under it the reaction is free with its dwells zeroed, arms no hold and suspends an existing hold's
+clamp (the car may come back up to the floor; the hold resumes above it and still releases when the bend reads open); above it
+the lift and the brake are bounded by the approach to the floor, `(v_floor − v) / T_RESTORE`, so they fade to zero at it instead
+of stepping off. The anticipation prices no node below the floor of its own curvature, which changes only nodes tighter than
+about R 14 m. The 10-31 replay variant of this guard (REPORT s.9) had three quirks, all closed here: freeing under the floor armed
+the hold, the brake stepped off at the floor, and the dwells re-ran at the crossing.
+
+**The candidate is never positive while the steering is heavy, dwell or not.** The coast's 0.3 s entry dwell let a positive
+candidate through while the torque was already at `T_COAST`; a limit rising mid-bend (which the bank credit now makes more
+common) is not an invitation to accelerate into heavy steering. The guard does not apply under the floor, where the heavy
+torque is the wheel angle's.
+
+**Replay (open loop on 57 routes, 672,785 engaged frames; closed-loop arcs and the E1 counterfactual with the real
+module; 2026-11-01).** The floor changes nothing at 8 m/s and up (0 of 593,806 frames) and removes every coast or brake
+frame under 5.4 m/s (15 → 0: the 0x14b walking-pace coast, and 0xa9's −0.7 at 11.9 mph into a turn, where the owner was
+on the gas within half a second). In closed-loop arcs a R 10 m right-angle turn entered at 8 m/s settles at 12.0 mph where
+the unchanged policy bottomed at 5.6 mph and stalled on a full loop; a blind R 5 m hairpin still slows to 3.66 m/s (floor
+3.81); no negative candidate under the floor in 38 runs; approached from below, the 0.3 m/s hold band stops the car 0.1–0.3
+m/s under the floor (11.4–11.8 mph). The bank continuation raises the in-bend limit on 31 % of the engaged frames above
+12 m/s (p90 +4.1 mph; by bank, p90 +4.3 at 2–3°, +6.0 at 3–4°, +7.2 over 4°): route 0x19e t=1448–1451 35.1 → 42.5 mph, the
+commute bend +2.6 to +4.5 mph of limit. The car's speed follows only where the rack has headroom: 0x158 53.8 → 57.3 mph,
+0x19e 1451 +2.4 mph forced-engaged; on the commute bend the steady speed is unchanged (52.4 → 52.5 mph) because the first
+coast's hold keeps it there, with more lifts (coast entries 14 → 18–21 over nine passes, pinned frames 0.1 → 1.2–3.3 %).
+No new braking anywhere (0 s of new requests at or under −0.3; 5.7 s removed); coast and brake entries at 8 m/s and up
+28/28 and 4/4; the town bends 0x156 and 0x184 unchanged. E1 (0x19e t=1415, the tightening right-hander): entry +0.00,
+turn-in +0.02, apex +0.00 mph on all four torque models (the 2.8 m/s² held floor was +1.2 / +1.8); the first differing frame
+is 1429.5, after the turn-in; beyond 40 m past the apex the following left bend, banked in its favour, is credited as
+intended. The heavy guard: acceleration at or above 0.3 m/s² with the torque at or above 0.85 (the turn-in surge) totals
+2.30 s on the 57 routes today, 4.65 s with the bank continuation alone, 0.00 s with the guard, and the guard invents no
+candidate where none exists. Still unmeasured: ride feel (the replay is open loop, the sims use predicted torque), any
+engaged right-angle turn at 5.4 m/s (none logged), wet roads, and whether the rack holds the 2.45–2.63 m/s² share the
+commute limit now asks. Not driven.
