@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: in progress; awaiting owner field validation.** Driven on a long highway road trip towing a trailer (owner: "did great"), with one complaint: in construction zones where traffic ran half on the shoulder, it pulled the car back toward the cones, even after a nudge on the wheel. The fade and the driver push below are the answer and have not been driven yet. Watch for a slow weave with a period of 8–10 s on a straight highway, for the car running wider than before through left curves, for how much room it still gives a cyclist, a parked car or a line of cones, whether a push away from the cones now stays, and on roads with only one painted line for whether it stays centred or pulls toward the missing line.
+**Status: in progress; awaiting owner field validation.** Driven on a long highway road trip towing a trailer (owner: "did great"), with one complaint: in construction zones where traffic ran half on the shoulder, it pulled the car back toward the cones, even after a nudge on the wheel. The fade and the driver push below are the answer and have not been driven yet. Watch for a slow weave with a period of 8–10 s on a straight highway, for the car running wider than before through left curves, for how much room it still gives a cyclist, a parked car or a line of cones, whether a push away from the cones now stays, and on roads with only one painted line for whether it stays centred or pulls toward the missing line. Calm steering, a filter on the torque controller's friction term on highway straights for the "small corrections that jump too quickly" reported with centering on and off, is new and not driven yet.
 
 ## What it does
 
@@ -68,6 +68,47 @@ The fade change and the driver push were checked on 26 drives of 2026-09-22 to 0
 - With one line and no width learned in the last 60 s, or with neither line (8 % of engaged time), it does nothing.
 - Real lanes narrower than 2.5 m exist (a 2.4 m stretch in the logs); the width gate stands the two-line correction down there.
 
+## Calm steering
+
+The owner's other complaint, with lane centering on and off alike: small steering corrections that jump too quickly. That is the stock torque controller, not the centering. Besides the model's lateral acceleration and the P and I terms, `LatControlTorque` adds a friction term, a ramp that puts up to ±0.33 m/s² (0.13 of full torque, about 50 counts) behind any error over 0.2 m/s². Its slope is about twice the P gain at highway speed, and it reads the measured steering angle, whose 0.1° sensor steps are worth more lateral acceleration the faster the car goes: at 30 m/s one step moves the torque by 0.016 (6.5 counts at 409) in a single frame, 0.011 of it from the friction ramp. It also reads each 20 Hz step of the model's plan, through the jerk look-ahead, as a short pulse. Nothing between the controller and the car smooths either.
+
+**On a highway straight the friction term goes through a 0.1 s low-pass filter.** Only that term: the model's lateral acceleration, roll, the learned offset, P and I are untouched. The filtered value is blended in by a gate made of smooth ramps, so nothing steps when it opens or closes; it closes at once and opens over a quarter of a second. With the gate shut the controller is stock to the bit. The filter runs every frame, engaged or not, so it is never stale when the gate opens.
+
+It is off, gate exactly 0:
+
+- **Below 22 m/s** (79 km/h). It opens fully by 30 m/s (108 km/h).
+- **Not straight:** once the desired or the measured steering angle reaches 3° (0.5 m/s² at 30 m/s); it starts closing from 0°.
+- **Moving:** while the desired or the measured angle changes faster than 8°/s (1.3 m/s³ at 30 m/s), starting from 5°/s. The desired angle's rate is read over 0.1 s, the measured angle's over 0.2 s, so one 0.1° sensor step reads 0.5°/s and does not shut it.
+- **Hands on the wheel** (steering pressed) or lateral control inactive.
+- For the first 0.2 s after start, until both rate windows are full.
+
+### Why these numbers
+
+They are BLaTv3's highway feedforward taper, verbatim, which used the same gates and filter on the whole feedforward. On BLaTv3 route 4d at 120–150 km/h near straight, the frame-to-frame change of the feedforward correlated 0.93 with the measured angle's noise and 0.02 with the model's target, and the same angle noise made a 28 times larger feedforward swing at highway speed than in town. On route 54 (47 min, replayed on its own logged inputs) the taper cut the straight-road torque step above 100 km/h by 48 % at the median and reversals from 10.9 to 1.3 a minute, with turn-in, overshoot and unwind timing unchanged; the owner found the highway calmer and curves fine. Here only the friction term is filtered: in a simulation made while designing it, that costs 20–30 ms less on a move for about 4 points less of the reduction, and it improves the phase margin on every plant tried.
+
+The rest is simulation, from this branch's tests on the Palisade at 30 m/s:
+
+| | stock | calm |
+|---|---|---|
+| Sensor staircase (0.3° wander, 0.1° steps) | largest step 0.0157, 194 reversals/min | 0.0061, 46/min; no bias |
+| Sensor flip-flopping between two steps | mean step 0.0042, 1,560 reversals/min | 0.0019, 513/min |
+| Model plan dithering ±0.02 m/s² at 20 Hz | mean step 0.023 | 0.009 |
+| Closed loop on a 0.1 m/s² hold, 0.15 s lag + 0.1 s delay, sensor steps only | limit cycle 0.032 peak-to-peak, 330 reversals/min | 0.0005, none |
+
+With 0.12 s of lag instead, stock's cycle is 0.064 peak-to-peak (0.096 under the 409 limits) at about 350 reversals a minute and calm brings it to 0.024 and 288 a minute: reduced, not flattened. With 0.13 of stiction in the simulated rack the wheel sticks on the hold and neither controller cycles. On a plant that stock cannot hold steady (0.2 s lag, 0.2 s delay, 0.1 s assumed delay) the gate opens and shuts with the swing and the swing is 6–9 % larger than stock's; held fully open it would be 19–26 % smaller. The tests hold calm to within 10 % of stock there, and to within 0.005 of stock wherever stock holds steady. In the flip-flop case a third of stock's reversals are left: the P term alone moves 0.005 on each step.
+
+### What it costs
+
+- A gentle highway move at 1–2.5°/s builds torque 4 frames (40 ms) later than stock to 25 % and 4–5 frames later to 63 % (the filter's time constant is 10 frames). A turn-in at 8°/s takes the gate below half within 8 frames, shuts it by 15, and keeps stock's timing.
+- Between 22 and 30 m/s it is only partly open: half at 26 m/s.
+- `controlsState.lateralControlState.torqueState.f` is the whole feedforward (trajectory, roll, offset and friction), so while the gate is open its friction part is the blended one, and process-replay's `controlsd` reference outputs change on highway-straight frames.
+- Upstream's other lever for the sensor steps, `steeringAngleDeadzoneDeg` in the car's torque tuning (Toyota uses 0.2°), is in opendbc and is not used here: in the design simulation with sensor steps only it raised hunting, by 20–94 % in mean step. If it is tried, A/B it on the car.
+- Not field validated.
+
+### Checking it
+
+`tools/scripts/calm_steering_replay.py <route or rlog path> [--min-run-s 5]` replays a route's logged inputs through the controller twice, stock and calm, and prints per speed band (0–20, 20–60, 60–100, 100–150 km/h), over straight runs of at least 5 s (engaged, hands off, under 3°), the largest step, mean step and reversals a minute, the gate's duty, and the friction and lateral-acceleration factor in use. Its PARITY line compares the stock replay with the logged output; it is about 0 on a route driven on this controller and a warning is printed when it is not, as on BLaT routes. The replay is open loop on the logged steering angle, so it shows how much of that angle's noise reaches the torque, not whether a closed-loop limit cycle stops; the closed-loop tests are the check for that.
+
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/lane_centering.py` — `get_lane_center` (the fit, the fade and the gates), `LaneCentering` (the filter, the learned width, the plan check and the driver push).
@@ -75,3 +116,6 @@ The fade change and the driver push were checked on 26 drives of 2026-09-22 to 0
 - `openpilot/common/params_keys.h` and both `openpilot/selfdrive/ui/layouts/settings/developer.py` and `openpilot/selfdrive/ui/mici/layouts/settings/developer.py` — persistent default-on toggle at the top of Dev in both screen layouts, available while engaged.
 - `openpilot/selfdrive/controls/tests/test_lane_centering_toggle.py` and `openpilot/selfdrive/ui/tests/test_developer_lane_centering.py` — defaults/persistence (including absent keys), live on/off/on behavior through real controls and Params, no control-loop Param reads, worker shutdown, curvature limits, disabled startup, maneuver/inactive gates, and both UI toggle callbacks/state refresh.
 - `openpilot/selfdrive/controls/tests/test_lane_centering.py` — geometry, the heading term, the 0.2 m/s² bound over offsets and headings at every speed, each gate, malformed model messages, the hand-over to the driver, the hold (needs a width, a valid line and a plan that agrees; expires; snaps to a new road within five frames and filters small changes), and a closed-loop run at 15/25/35 m/s with 0.4–0.45 s of steering latency and a model straightening up over 1–2 s that must settle within 5 cm of center without overshoot; the fade on a plan that is moving over; the driver push (agreement, each way it ends, the pushes that are not agreement, the model moving the car while the wheel is held, a push in several presses, judging after the last press, touches costing only their own time, no lines, a push right after lateral control comes back or into a lane change) and a closed-loop push past cones. Each of 29 single-line mutations of the original module, and each of 27 of the fade and push code, fails a test.
+- `openpilot/selfdrive/controls/lib/calm_steering.py` — calm steering: the gate, the 0.1 s filter and the blend; `openpilot/selfdrive/controls/lib/latcontrol_torque.py` passes its friction term through it (one import, one line in the constructor and the friction line).
+- `tools/scripts/calm_steering_replay.py` — the route replay, stock against calm, and `chatter()`, the step and reversal measure the tests share.
+- `openpilot/selfdrive/controls/tests/test_calm_steering.py` — stock to the bit wherever the gate is shut (three sequences recorded from the unmodified controller), the sensor staircase at 22–35 m/s, sensor flip-flop and model dither, turn-in and gentle-move timing, hands on and off, the filter and the angle windows kept warm while the gate is shut, whether by speed, lateral control being inactive or the hands being on, the gate's edges, windows, the rate's scale at the 5°/s knee, roll (also through the controller), angle offset and sign, non-finite friction and angles, closed loops with and without stiction under both steering limits, a lane-centering-sized ramp, a speed sweep, and the replay tool on a synthetic log. Each of 10 mutations (the filter's time constant, each gate edge, the smoothstep, a window, the pressed check, filtering the whole feedforward, the opening ramp, per-frame rates) fails a test, and so does each of 9 more (windows filled only while active, windows filled only while hands off, a rate over the sample count rather than the window's span, each of the four non-finite checks, the gate-0 pass-through, a sign slip in the controller's call).
