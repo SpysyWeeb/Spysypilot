@@ -139,6 +139,7 @@ class SelfdriveD:
     self.gap_button_frame_count = 0
     self.experimental_mode_switched = False
     self.recalibrating_seen = False
+    self.startup_cruise_checked = False
     self.dm_lockout_set = False
     self.dm_uncertain_alerted = False
     self.state_machine = StateMachine()
@@ -268,6 +269,12 @@ class SelfdriveD:
         (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
         (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
         self.events.add(EventName.pedalPressed)
+
+      # Audible alert when stock cruise was already on at startup, since openpilot will cancel it
+      if not self.startup_cruise_checked:
+        self.startup_cruise_checked = True
+        if CS.cruiseState.enabled and not self.events.contains(ET.ENABLE) and not REPLAY:
+          self.events.add(EventName.startupCruiseCanceled)
 
     # Create events for temperature, disk space, and memory
     if self.sm['deviceState'].thermalStatus >= ThermalStatus.overheated:
