@@ -18,9 +18,10 @@ from openpilot.selfdrive.selfdrived.alertmanager import OFFROAD_ALERTS
 
 BACKLIGHT_OFFROAD = 65 if HARDWARE.get_device_type() == "mici" else 50
 PARAM_UPDATE_TIME = 1 / 5.0
-ONROAD_DIM_BRIGHTNESS = 10  # percent; engaged onroad screen fades to this when nothing needs attention
+ONROAD_DIM_BRIGHTNESS = 5  # percent; engaged onroad screen fades to this when nothing needs attention
 ONROAD_DIM_FADE_TIME = 5.0  # seconds to fade from ambient brightness down to the dim level
 ONROAD_DIM_WAKE_TIME = 1.0  # seconds to restore ambient brightness on any wake condition
+ONROAD_DIM_HOLD_TIME = 10.0  # seconds of continuous quiet before the fade starts (comma 3X onroad touch window length)
 
 
 class UIStatus(Enum):
@@ -299,6 +300,7 @@ class Device:
     self._brightness_target: int = 0
     self._dim_fraction: float = 0.0
     self._dim_last_ts: float = time.monotonic()
+    self._dim_hold_until: float = 0.0
 
   @property
   def awake(self) -> bool:
@@ -385,11 +387,16 @@ class Device:
       return self._dim_fraction
 
     sm = ui_state.sm
+    ss = sm['selfdriveState']
     # stale selfdriveState mirrors AlertRenderer.get_alert's own "Waiting to start" / "System Unresponsive" alerts
     ss_fresh = sm.alive['selfdriveState'] and sm.valid['selfdriveState'] and sm.recv_frame['selfdriveState'] > ui_state.started_frame
-    quiet = (ui_state.status == UIStatus.ENGAGED and ss_fresh and
-             sm['selfdriveState'].alertSize == log.SelfdriveState.AlertSize.none and
-             now > self._interaction_time)
+    attention = not (ui_state.status == UIStatus.ENGAGED and ss_fresh and ss.alertSize == log.SelfdriveState.AlertSize.none)
+    if attention:
+      # separate from the interactive timeout, whose reset drives layout callbacks; a touch is its own hold
+      self._dim_hold_until = now + ONROAD_DIM_HOLD_TIME
+      if ss.alertStatus == log.SelfdriveState.AlertStatus.critical or ss.alertSize == log.SelfdriveState.AlertSize.full:
+        self._dim_fraction = 0.0  # critical or full-screen alerts restore ambient at once
+    quiet = (not attention) and now > self._dim_hold_until and now > self._interaction_time
     step = dt / ONROAD_DIM_FADE_TIME if quiet else -dt / ONROAD_DIM_WAKE_TIME
     self._dim_fraction = float(np.clip(self._dim_fraction + step, 0.0, 1.0))
     return self._dim_fraction
