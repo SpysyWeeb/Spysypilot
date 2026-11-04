@@ -220,6 +220,9 @@ class LongitudinalMpc:
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
     self.reset()
     self.source = LongitudinalPlanSource.cruise
+    # the effective follow time of the last update, pads included; not cleared by reset(), which a failed solve calls
+    # inside update()
+    self.t_follow = get_T_FOLLOW()
 
   def reset(self):
     self.solver.reset()
@@ -452,6 +455,7 @@ class LongitudinalMpc:
       jerk_scale = 1.0
       t_follow_pad = 0.0
     t_follow = get_T_FOLLOW(personality) + t_follow_pad
+    self.t_follow = t_follow
     self.set_weights(prev_accel_constraint and not restoring, personality, jerk_scale)
 
     self.yref[:,:] = 0.0

@@ -201,6 +201,7 @@ class Controls:
     lead_one = self.sm['radarState'].leadOne
     hudControl.leadDistance = lead_one.dRel if lead_one.present and (lead_one.radar or lead_one.modelProb > 0.5) else 0.0
     hudControl.leadDistanceBars = self.sm['selfdriveState'].personality.raw + 1
+    hudControl.leadTargetDistance = self.sm['longitudinalPlan'].leadTargetDistance
     hudControl.visualAlert = self.sm['selfdriveState'].alertHudVisual
 
     hudControl.rightLaneVisible = True
