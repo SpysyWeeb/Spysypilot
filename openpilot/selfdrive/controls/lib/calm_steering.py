@@ -9,7 +9,7 @@ small corrections that jump too quickly.
 
 Here the friction term's OUTPUT passes through a 0.1 s first-order filter, blended in by a gate that is 1.0 only when
 all of these hold, each through a smoothstep so nothing steps:
-  - speed: opens from 22 to 30 m/s (79 to 108 km/h);
+  - speed: opens from 20 to 28 m/s (72 to 101 km/h);
   - near straight: closes as max(|desired|, |measured|) steering angle goes from 0 to 3 deg (0.50 m/s^2 at 30 m/s);
   - holding, not moving: closes as the faster of the desired angle's rate (0.1 s window) and the measured angle's
     rate (0.2 s window) goes from 5 to 8 deg/s (0.83 to 1.32 m/s^3 at 30 m/s); closed until both windows are full;
@@ -32,8 +32,8 @@ import numpy as np
 from openpilot.common.filter_simple import FirstOrderFilter
 
 CALM_RC_S = 0.1                 # friction filter time constant: a 0.0165 m/s^2 (0.1 deg) step at 30 m/s takes 0.1 s to 63 %
-CALM_SPEED_MPS = 30.0           # fully open from 30 m/s (108 km/h), where 0.1 deg is 0.0165 m/s^2
-CALM_SPEED_BLEND_MPS = 8.0      # opens from 22 m/s (79 km/h), where 0.1 deg is 0.0112 m/s^2
+CALM_SPEED_MPS = 28.0           # fully open from 28 m/s (101 km/h), the owner's cruising speed, where 0.1 deg is 0.0153 m/s^2
+CALM_SPEED_BLEND_MPS = 8.0      # opens from 20 m/s (72 km/h), where 0.1 deg is 0.0098 m/s^2
 CALM_ANGLE_DEG = 3.0            # closed at 3 deg of steering angle: 0.50 m/s^2 at 30 m/s
 CALM_RATE_DEG_S = 5.0           # starts closing at 5 deg/s of angle rate: 0.83 m/s^3 at 30 m/s
 CALM_RATE_BLEND_DEG_S = 3.0     # closed at 8 deg/s: 1.32 m/s^3 at 30 m/s

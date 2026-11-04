@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: in progress; awaiting owner field validation.** Driven on a long highway road trip towing a trailer (owner: "did great"), with one complaint: in construction zones where traffic ran half on the shoulder, it pulled the car back toward the cones, even after a nudge on the wheel. The fade and the driver push below are the answer and have not been driven yet. Watch for a slow weave with a period of 8–10 s on a straight highway, for the car running wider than before through left curves, for how much room it still gives a cyclist, a parked car or a line of cones, whether a push away from the cones now stays, and on roads with only one painted line for whether it stays centred or pulls toward the missing line. Calm steering, a filter on the torque controller's friction term on highway straights for the "small corrections that jump too quickly" reported with centering on and off, is new and not driven yet.
+**Status: in progress; awaiting owner field validation.** Driven on a long highway road trip towing a trailer (owner: "did great"), with one complaint: in construction zones where traffic ran half on the shoulder, it pulled the car back toward the cones, even after a nudge on the wheel. The fade and the driver push below are the answer and have not been driven yet. Watch for a slow weave with a period of 8–10 s on a straight highway, for the car running wider than before through left curves, for how much room it still gives a cyclist, a parked car or a line of cones, whether a push away from the cones now stays, and on roads with only one painted line for whether it stays centred or pulls toward the missing line. Calm steering, a filter on the torque controller's friction term on highway straights for the "small corrections that jump too quickly" reported with centering on and off, was driven on 2026-11-04 (route 000001c3): the fast grain fell as replayed, but the owner still felt the wheel switch left and right every half second, and the logs place that oscillation in the model's plan itself (0.5–2 Hz, the same size in curves, followed by the car 0.33 s later), not in the torque controller; it is tracked separately. The speed edge now opens the gate fully at the owner's cruising speed and is not driven.
 
 ## What it does
 
@@ -76,7 +76,7 @@ The owner's other complaint, with lane centering on and off alike: small steerin
 
 It is off, gate exactly 0:
 
-- **Below 22 m/s** (79 km/h). It opens fully by 30 m/s (108 km/h).
+- **Below 20 m/s** (72 km/h). It opens fully by 28 m/s (101 km/h), the owner's cruising speed.
 - **Not straight:** once the desired or the measured steering angle reaches 3° (0.5 m/s² at 30 m/s); it starts closing from 0°.
 - **Moving:** while the desired or the measured angle changes faster than 8°/s (1.3 m/s³ at 30 m/s), starting from 5°/s. The desired angle's rate is read over 0.1 s, the measured angle's over 0.2 s, so one 0.1° sensor step reads 0.5°/s and does not shut it.
 - **Hands on the wheel** (steering pressed) or lateral control inactive.
@@ -84,7 +84,7 @@ It is off, gate exactly 0:
 
 ### Why these numbers
 
-They are BLaTv3's highway feedforward taper, verbatim, which used the same gates and filter on the whole feedforward. On BLaTv3 route 4d at 120–150 km/h near straight, the frame-to-frame change of the feedforward correlated 0.93 with the measured angle's noise and 0.02 with the model's target, and the same angle noise made a 28 times larger feedforward swing at highway speed than in town. On route 54 (47 min, replayed on its own logged inputs) the taper cut the straight-road torque step above 100 km/h by 48 % at the median and reversals from 10.9 to 1.3 a minute, with turn-in, overshoot and unwind timing unchanged; the owner found the highway calmer and curves fine. Here only the friction term is filtered: in a simulation made while designing it, that costs 20–30 ms less on a move for about 4 points less of the reduction, and it improves the phase margin on every plant tried.
+All but the speed edge are BLaTv3's highway feedforward taper, verbatim, which used the same gates and filter on the whole feedforward. On BLaTv3 route 4d at 120–150 km/h near straight, the frame-to-frame change of the feedforward correlated 0.93 with the measured angle's noise and 0.02 with the model's target, and the same angle noise made a 28 times larger feedforward swing at highway speed than in town. On route 54 (47 min, replayed on its own logged inputs) the taper cut the straight-road torque step above 100 km/h by 48 % at the median and reversals from 10.9 to 1.3 a minute, with turn-in, overshoot and unwind timing unchanged; the owner found the highway calmer and curves fine. Here only the friction term is filtered: in a simulation made while designing it, that costs 20–30 ms less on a move for about 4 points less of the reduction, and it improves the phase margin on every plant tried. The speed edge is this branch's own: full at 28 m/s instead of 30, opening from 20, because the owner cruises at 28–29 m/s. Replaying the owner's route 000001c3 (105 s of highway straight, median 28.8 m/s, a 2° road bank), the gate's mean rises from 0.57 to 0.67, the mean torque step from 0.0092 to 0.0086 against stock's 0.0133, and the remaining limiter is the ~1° the wheel holds against the bank. A gated 3-frame average of the measured lateral acceleration, for the P term's share of the sensor steps, was built and reviewed and is held back: on plants with this car's 0.33 s delay it can settle into a sustained 1.6 Hz cycle of about 11 counts that stock holds flat.
 
 The rest is simulation, from this branch's tests on the Palisade at 30 m/s:
 
@@ -100,7 +100,7 @@ With 0.12 s of lag instead, stock's cycle is 0.064 peak-to-peak (0.096 under the
 ### What it costs
 
 - A gentle highway move at 1–2.5°/s builds torque 4 frames (40 ms) later than stock to 25 % and 4–5 frames later to 63 % (the filter's time constant is 10 frames). A turn-in at 8°/s takes the gate below half within 8 frames, shuts it by 15, and keeps stock's timing.
-- Between 22 and 30 m/s it is only partly open: half at 26 m/s.
+- Between 20 and 28 m/s it is only partly open: half at 24 m/s.
 - `controlsState.lateralControlState.torqueState.f` is the whole feedforward (trajectory, roll, offset and friction), so while the gate is open its friction part is the blended one, and process-replay's `controlsd` reference outputs change on highway-straight frames.
 - Upstream's other lever for the sensor steps, `steeringAngleDeadzoneDeg` in the car's torque tuning (Toyota uses 0.2°), is in opendbc and is not used here: in the design simulation with sensor steps only it raised hunting, by 20–94 % in mean step. If it is tried, A/B it on the car.
 - Not field validated.
