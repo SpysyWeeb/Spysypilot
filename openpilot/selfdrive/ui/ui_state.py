@@ -18,6 +18,9 @@ from openpilot.selfdrive.selfdrived.alertmanager import OFFROAD_ALERTS
 
 BACKLIGHT_OFFROAD = 65 if HARDWARE.get_device_type() == "mici" else 50
 PARAM_UPDATE_TIME = 1 / 5.0
+ONROAD_DIM_BRIGHTNESS = 10  # percent; engaged onroad screen fades to this when nothing needs attention
+ONROAD_DIM_FADE_TIME = 5.0  # seconds to fade from ambient brightness down to the dim level
+ONROAD_DIM_WAKE_TIME = 1.0  # seconds to restore ambient brightness on any wake condition
 
 
 class UIStatus(Enum):
@@ -294,6 +297,8 @@ class Device:
     self._brightness_thread: threading.Thread | None = None
     self._brightness_event = threading.Event()
     self._brightness_target: int = 0
+    self._dim_fraction: float = 0.0
+    self._dim_last_ts: float = time.monotonic()
 
   @property
   def awake(self) -> bool:
@@ -359,7 +364,9 @@ class Device:
 
       clipped_brightness = float(np.interp(clipped_brightness, [0, 1], [30, 100]))
 
-    brightness = round(self._brightness_filter.update(clipped_brightness))
+    ambient = self._brightness_filter.update(clipped_brightness)
+    dim_level = min(ONROAD_DIM_BRIGHTNESS, ambient)
+    brightness = round(ambient - (ambient - dim_level) * self._update_dim_fraction())
     if not self._awake:
       brightness = 0
 
@@ -367,6 +374,25 @@ class Device:
       self._brightness_target = brightness
       self._brightness_event.set()
       self._last_brightness = brightness
+
+  def _update_dim_fraction(self) -> float:
+    # Engaged-only onroad dimming: fade down while nothing needs attention, wake quickly otherwise
+    now = time.monotonic()
+    dt = float(np.clip(now - self._dim_last_ts, 0.0, 0.25))  # a stalled frame must not jump the fade
+    self._dim_last_ts = now
+    if not ui_state.started:
+      self._dim_fraction = 0.0
+      return self._dim_fraction
+
+    sm = ui_state.sm
+    # stale selfdriveState mirrors AlertRenderer.get_alert's own "Waiting to start" / "System Unresponsive" alerts
+    ss_fresh = sm.alive['selfdriveState'] and sm.valid['selfdriveState'] and sm.recv_frame['selfdriveState'] > ui_state.started_frame
+    quiet = (ui_state.status == UIStatus.ENGAGED and ss_fresh and
+             sm['selfdriveState'].alertSize == log.SelfdriveState.AlertSize.none and
+             now > self._interaction_time)
+    step = dt / ONROAD_DIM_FADE_TIME if quiet else -dt / ONROAD_DIM_WAKE_TIME
+    self._dim_fraction = float(np.clip(self._dim_fraction + step, 0.0, 1.0))
+    return self._dim_fraction
 
   def _update_wakefulness(self):
     # Handle interactive timeout
