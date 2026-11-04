@@ -49,7 +49,7 @@ def quantize(angle_deg):
 
 def open_fraction(v):
   # the speed factor from literals, so a silent re-tune of the 22-30 m/s ramp fails here
-  t = min(max((v - 22.0) / (30.0 - 22.0), 0.0), 1.0)
+  t = min(max((v - 20.0) / (28.0 - 20.0), 0.0), 1.0)
   return t * t * (3 - 2 * t)
 
 
@@ -161,12 +161,12 @@ def golden_sine(v):
 
 
 def golden_boundary():
-  # 22.0 m/s, the desired angle ramping at 5.0 deg/s to 3.0 deg and back: the speed factor is exactly 0 throughout and the
+  # 20.0 m/s, the desired angle ramping at 5.0 deg/s to 3.0 deg and back: the speed factor is exactly 0 throughout and the
   # angle factor wherever 3.0 deg is reached
   t = np.arange(2000) * DT_CTRL
   phase = t % 2.0
   desired = np.clip(np.minimum(5.0 * phase, 5.0 * (2.0 - phase)), 0.0, 3.0)
-  curvature = [-VM.calc_curvature(math.radians(a), 22.0, 0.0) for a in desired]
+  curvature = [-VM.calc_curvature(math.radians(a), 20.0, 0.0) for a in desired]
   return [quantize(a) for a in np.concatenate([np.zeros(30), desired[:-30]])], curvature
 
 
@@ -175,19 +175,19 @@ class TestCalmSteering(OpenpilotTestCase):
   @parameterized.expand([
     ('town', golden_sine(15.0), 15.0, False, (-14.893529756723115, -0.403047405825556, 0.39999973948644113)),
     ('highway_hands_on', golden_sine(30.0), 30.0, True, (-2.225311632847072, -0.2689719138137526, 0.2748371188038936)),
-    ('gate_boundary', golden_boundary(), 22.0, False, (188.77596307768636, 0.14512966860138285, -0.09726929510767333)),
+    ('gate_boundary', golden_boundary(), 20.0, False, (164.82866129079488, 0.12670704866893678, -0.08461346363425336)),
   ])
   def test_golden(self, _, sequence, v, pressed, golden):
     run = drive(make_controller(CP, CI, True), v, *sequence, pressed=pressed)
     np.testing.assert_allclose((run.out.sum(), run.out[500], run.out[1999]), golden, rtol=0, atol=1e-12)
     assert np.all(run.gate == 0.0)
-    assert CalmSteering.gate_from(22.0, 3.0, 5.0, False) == 0.0
+    assert CalmSteering.gate_from(20.0, 3.0, 5.0, False) == 0.0
     assert CalmSteering.gate_from(30.0, 3.0, 0.0, False) == 0.0
-    assert CalmSteering.gate_from(22.0, 0.0, 0.0, False) == 0.0
+    assert CalmSteering.gate_from(20.0, 0.0, 0.0, False) == 0.0
     assert CalmSteering.gate_from(30.0, 0.0, 5.0, False) == 1.0
 
   # (b1) the sensor staircase: a 0.1 deg step is 0.0159 of torque through P and friction at 30 m/s
-  @parameterized.expand([(22.0,), (26.0,), (30.0,), (35.0,)])
+  @parameterized.expand([(20.0,), (26.0,), (30.0,), (35.0,)])
   def test_staircase(self, v):
     stock, calm = both(v, *staircase(v))
     s, c = chatter(stock.out[LEAD:]), chatter(calm.out[LEAD:])
@@ -411,8 +411,10 @@ class TestCalmSteering(OpenpilotTestCase):
   # (h) the gate
   def test_gate_table(self):
     gate_from = CalmSteering.gate_from
-    for v, expected in ((24.0, 0.15625), (26.0, 0.5), (28.0, 0.84375)):
+    for v, expected in ((22.0, 0.15625), (24.0, 0.5), (26.0, 0.84375)):
       assert gate_from(v, 0.0, 0.0, False) == expected
+    assert gate_from(20.0, 0.0, 0.0, False) == 0.0
+    assert gate_from(28.0, 0.0, 0.0, False) == 1.0
     for angle, expected in ((0.75, 0.84375), (1.5, 0.5), (2.25, 0.15625)):
       assert gate_from(30.0, angle, 0.0, False) == expected
       assert gate_from(30.0, -angle, 0.0, False) == expected
