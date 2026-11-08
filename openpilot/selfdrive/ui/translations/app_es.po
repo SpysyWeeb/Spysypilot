@@ -124,7 +124,7 @@ msgstr "CONECTAR"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "CONNECTING..."
-msgstr "CONECTAR"
+msgstr "CONECTANDO..."
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Cabin Camera"
@@ -139,7 +139,7 @@ msgstr "Cancelar"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "Cellular Metered"
-msgstr "Medición celular"
+msgstr "Red celular medida"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Change Language"
@@ -300,7 +300,7 @@ msgstr "El modo experimental no está disponible actualmente en este coche, ya q
 
 #: openpilot/system/ui/widgets/network.py
 msgid "FORGETTING..."
-msgstr "OLVIDAR..."
+msgstr "OLVIDANDO..."
 
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Finish Setup"
