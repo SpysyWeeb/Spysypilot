@@ -124,7 +124,7 @@ msgstr "CONNECTER"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "CONNECTING..."
-msgstr "CONNECTER..."
+msgstr "CONNEXION..."
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Cabin Camera"
@@ -244,7 +244,7 @@ msgstr "Activer les alertes de sortie de voie"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "Enable Roaming"
-msgstr "Activer openpilot"
+msgstr "Activer l'itinérance"
 
 #: openpilot/selfdrive/ui/layouts/settings/developer.py
 msgid "Enable SSH"
@@ -252,7 +252,7 @@ msgstr "Activer SSH"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "Enable Tethering"
-msgstr "Activer les alertes de sortie de voie"
+msgstr "Activer le partage de connexion"
 
 #: openpilot/selfdrive/ui/layouts/settings/toggles.py
 msgid "Enable driver monitoring even when openpilot is not engaged."
@@ -300,7 +300,7 @@ msgstr "Le mode expérimental est actuellement indisponible sur cette voiture ca
 
 #: openpilot/system/ui/widgets/network.py
 msgid "FORGETTING..."
-msgstr "OUBLIER..."
+msgstr "SUPPRESSION..."
 
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Finish Setup"
@@ -337,7 +337,7 @@ msgstr "ÉLEVÉ"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "Hidden Network"
-msgstr "Réseau"
+msgstr "Réseau masqué"
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "INSTALL"
@@ -567,7 +567,7 @@ msgstr "Sélectionner une branche"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Select a language"
-msgstr "Sélectionner un langage"
+msgstr "Sélectionner une langue"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "Serial"
