@@ -464,13 +464,21 @@ class TestRollHorizon(unittest.TestCase):
     self.assertAlmostEqual(a.v_limit, b.v_limit, places=6)
 
   def test_a_far_bend_a_bank_could_explain_asks_for_the_foot_off_at_most(self):
-    # a sweeper 4 s out at 30 m/s whose limit sits 15 % under the car: far, and within the doubt a bank leaves
+    from unittest.mock import patch
+    from openpilot.selfdrive.controls.lib import model_curve_speed
+    # a sweeper 4 s out at 30 m/s whose limit sits 20 % under the car: far, and within the doubt a bank leaves. Priced as the
+    # module prices it (the default car holds its demonstrated lateral at this speed), and settled past the jerk ramp
     v = 30.0
-    kappa = (TORQUE_BUDGET - FRICTION) * FACTOR / (v * (1.0 - FAR_LIMIT_UNCERTAINTY + 0.10)) ** 2
+    margin = authority_margin(FACTOR, FRICTION, held_lateral(v))
+    kappa = margin / (v * (1.0 - FAR_LIMIT_UNCERTAINTY + 0.05)) ** 2
     far = curve_ahead(v, 120.0, 60.0, kappa)
-    result = settle(ModelCurveSpeedLimiter(make_cp()), far, 3, v_ego=v, lateral_active=True, lateral_state=tracking())
+    result = settle(ModelCurveSpeedLimiter(make_cp()), far, 40, v_ego=v, lateral_active=True, lateral_state=tracking())
     self.assertLess(result.v_limit, v)
-    self.assertGreaterEqual(result.a_target, -FAR_NODE_DECEL_MAX - 1e-9)
+    self.assertGreaterEqual(result.v_limit, v * (1.0 - FAR_LIMIT_UNCERTAINTY))   # inside the doubt
+    self.assertAlmostEqual(result.a_target, -FAR_NODE_DECEL_MAX, places=6)       # the cap binds ...
+    with patch.object(model_curve_speed, 'FAR_NODE_DECEL_MAX', math.inf):
+      uncapped = settle(ModelCurveSpeedLimiter(make_cp()), far, 40, v_ego=v, lateral_active=True, lateral_state=tracking())
+    self.assertLess(uncapped.a_target, -FAR_NODE_DECEL_MAX - 0.2)                 # ... where the bend alone would ask for more
     # the same bend 1 s out: the bank is the car's own and the brake is allowed
     near = curve_ahead(v, 30.0, 60.0, kappa)
     result = settle(ModelCurveSpeedLimiter(make_cp()), near, 20, v_ego=v, lateral_active=True, lateral_state=tracking())   # past the jerk ramp
