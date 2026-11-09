@@ -32,7 +32,6 @@ LATCH_THRESHOLD = 0.55
 RELEASE_THRESHOLD = 0.30
 LEAD_RC = 1.0             # s
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
-GAS_OVERRIDE_S = 10.0     # s, a gas press cancels approach shaping for this long; the hold may still re-enter
 STOP_POSITION_HOLD_S = 4.0
 EXTEND_RATE = 3.0         # m/s, the latched point may follow the model's endpoint forward this fast: the latch trips
                           # mid-collapse of the path, and a frozen target would park the car short of the real line
@@ -94,13 +93,12 @@ class ForceStops:
     self.lead_filter = FirstOrderFilter(0.0, LEAD_RC, dt)
     self.release_filter = FirstOrderFilter(0.0, RELEASE_RC, dt)
     self.clear_window = deque(maxlen=round(CLEAR_WINDOW_S / dt))
-    self.override_timer = 0.0
     self.invalid_s = 0.0
     self.rearm_remaining = 0.0
     self.reset()
 
   def reset(self):
-    # the episode state only: override_timer, invalid_s and rearm_remaining are memories that must survive the transient
+    # the episode state only: invalid_s and rearm_remaining are memories that must survive the transient
     # resets a lingering lead, a lane change or a model dropout cause; a disengage clears them in update()
     self.detect_filter.x = 0.0
     self.braking_filter.x = 0.0
@@ -167,7 +165,6 @@ class ForceStops:
   def update(self, obs, CS, experimental_mode, enabled, model_valid, a_prev_output):
     if not math.isfinite(CS.vEgo) or CS.brakePressed or not enabled:
       self.reset()
-      self.override_timer = 0.0
       self.invalid_s = 0.0
       self.rearm_remaining = 0.0
       return ForceStopsResult()
@@ -175,14 +172,12 @@ class ForceStops:
     a_prev_output = a_prev_output if math.isfinite(a_prev_output) else 0.0
 
     if CS.gasPressed:
-      self.override_timer = GAS_OVERRIDE_S
       if self.holding or self.forcing:
         # the tap breaks a hold or a commitment; stopping again with stop evidence inside REARM_S re-enters the hold, as
         # after a lead. Only the hold used to arm it, so a tap at speed left the car on the raw stop bit at the line
         self.rearm_remaining = REARM_S
       self.reset()
       return ForceStopsResult()
-    self.override_timer = max(self.override_timer - self.dt, 0.0)
     self.rearm_remaining = max(self.rearm_remaining - self.dt, 0.0)
 
     # the mode gates entry only; a later mode exit never strips a commitment or a hold
@@ -251,9 +246,6 @@ class ForceStops:
       # at walking pace the model's stopped plan ends a few centimeters behind the car, so a commitment reads a non-positive
       # endpoint at any speed like one inside the setback, and the hold above forms on it
       self.reset()
-      return ForceStopsResult()
-
-    if self.override_timer > 0.0:
       return ForceStopsResult()
 
     just_committed = False

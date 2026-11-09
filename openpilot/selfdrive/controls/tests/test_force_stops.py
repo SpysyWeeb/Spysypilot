@@ -5,7 +5,7 @@ import pytest
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DOWN_DEADBAND, DOWN_RATE, DOWN_SPEED, DV_MAX,
-                                                           EXTEND_RATE, FOLLOW_CONFIRM_S, ForceStops, GAS_OVERRIDE_S,
+                                                           EXTEND_RATE, FOLLOW_CONFIRM_S, ForceStops,
                                                            LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
                                                            PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
                                                            RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH, RELEASE_THRESHOLD, RESUME_SPEED)
@@ -154,14 +154,16 @@ class TestMovingReleases:
     assert run(fs, 3.0, obs(path_end=30.0, should_stop=False, braking=False), car_state(2.0)).stop_x is None
     assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
 
-  def test_brake_releases_and_gas_suppresses_shaping_for_the_grace(self):
+  def test_brake_and_gas_release_and_the_next_stop_is_shaped_and_committed_at_once(self):
+    # no gas grace (removed 2026-11-08, owner ruling): a gas press no longer suppresses shaping and new commitments for 10 s. On the
+    # road the planner's reset while long control is off wiped that grace after every press but a one-frame blip
     fs, _ = committed()
     assert not run(fs, 0.05, obs(), car_state(10.0, brake=True)).holding and not fs.forcing
     fs, _ = committed()
     run(fs, 0.05, obs(), car_state(10.0, gas=True))
     assert not fs.forcing
-    assert run(fs, GAS_OVERRIDE_S - 1.0, obs(path_end=60.0, should_stop=False, early=True), car_state(10.0)).v_cruise_cap == NO_CAP
-    assert run(fs, 1.5, obs(path_end=60.0, should_stop=False, early=True), car_state(10.0)).v_cruise_cap < NO_CAP
+    assert run(fs, DT_MDL, obs(path_end=60.0, should_stop=False, early=True), car_state(10.0)).v_cruise_cap < NO_CAP
+    commit_on_strict_evidence_on(fs, 10.0, 60.0)
 
   def test_model_invalid_is_debounced(self):
     fs, _ = committed()

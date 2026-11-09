@@ -7,7 +7,7 @@ import pytest
 
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
-from openpilot.selfdrive.controls.lib.force_stops import RELEASE_OPEN_FRAMES
+from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, QUALIFY_S, RELEASE_OPEN_FRAMES
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
@@ -314,6 +314,42 @@ def test_a_healthy_model_after_the_dropout_judges_the_hold_as_before_it(green):
     assert not any(bit or held or stopping for bit, held, stopping, _ in runs[1][RELEASE_OPEN_FRAMES - 1:]) and runs[1][-1][3]
   else:
     assert all(bit and held and stopping and not go for bit, held, stopping, go in runs[1])
+
+
+@pytest.mark.parametrize('press', ['tap', 'blip'])
+def test_a_model_stop_right_after_a_gas_override_is_shaped_and_committed_at_once(press):
+  # the road's gas override: carState.gasPressed, with controlsState.longControlState off from the frame controlsd has seen the press
+  # until a frame after its release. The planner resets Force Stops while long control is off, so the 10 s gas grace never outlived
+  # a tap; a blip one planner frame saw with long control still on was the one press it did outlive, and with the grace gone that
+  # blip no longer suppresses the next stop for 10 s. A red light right after the press is shaped and committed on the same frames
+  # as with no press at all (manual Experimental here: CEM, where it owns the mode, still drops it for 2 s after a pedal)
+  presses = {'none': [(False, LongCtrlState.pid)] * 6,
+             'tap': [(True, LongCtrlState.pid)] + [(True, LongCtrlState.off)] * 4 + [(False, LongCtrlState.off)],
+             'blip': [(True, LongCtrlState.pid)] + [(False, LongCtrlState.pid)] * 5}
+  runs = []
+  for gas in ('none', press):
+    planner, sm = LongitudinalPlanner(car_params(), init_v=15.0), PlannerMessages(v_ego=15.0)
+    set_model(sm, length=150.0, accel=0.0, should_stop=False, moving=True)
+    step(planner, sm, frames=20)
+    for pressed, state in presses[gas]:
+      sm['carState'].gasPressed, sm['controlsState'].longControlState = pressed, state
+      step(planner, sm)
+    sm['carState'].gasPressed, sm['controlsState'].longControlState = False, LongCtrlState.pid
+    results = []
+    update = planner.force_stops.update
+
+    def record(*args, update=update, results=results):
+      results.append(update(*args))
+      return results[-1]
+
+    planner.force_stops.update = record
+    for i in range(40):
+      set_model(sm, length=60.0 - 15.0 * planner.dt * i, accel=-1.0, should_stop=False)
+      step(planner, sm)
+    runs.append(([r.v_cruise_cap < NO_CAP for r in results], [r.stop_x is not None for r in results]))
+  assert runs[1] == runs[0]
+  shaped, committed = runs[1]
+  assert shaped[0] and committed.index(True) <= round(QUALIFY_S / planner.dt) + 1 and all(committed[committed.index(True):])
 
 
 def test_green_waits_for_urgent_min_then_releases_without_needing_a_second_path_opening():

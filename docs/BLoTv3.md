@@ -399,7 +399,7 @@ States: `idle → shaping → committed → holding → (committed | idle)`.
   commitment whole — the approach profile's anchor and the open-path count go with it, so the next commitment enters its
   ramp from the published target (D37) and its green release from zero. Fast re-entry: a lead **or** a gas tap that
   breaks a hold **or** a moving commitment arms `REARM_S`; inside that window, if the car is at standstill again with stop
-  evidence present, `holding` is re-entered directly; the 10 s gas grace suppresses only the shaping cap.
+  evidence present, `holding` is re-entered directly.
 - Non-goal: no committed-lifetime + delay-projection scheme to move `shouldStop` earlier — tried
   on route 29 in BLoTv2 (0.450 s landed inside the 0.5 s actuator delay and weakened a fail-closed
   release). Holding engages at standstill only.
