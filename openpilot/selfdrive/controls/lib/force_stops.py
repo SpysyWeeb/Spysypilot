@@ -151,7 +151,7 @@ class ForceStops:
     return ForceStopsResult()
 
   def _qualify(self, obs, v_ego, tracking_lead):
-    # one second of strict, lead-free stop evidence on a world-fixed endpoint commits before the classic window
+    # QUALIFY_S of strict, lead-free stop evidence on a world-fixed endpoint commits before the classic window
     if not (obs.strict_stop and not tracking_lead and not obs.committed_turn and 0.0 < obs.path_end < STOP_COMMIT_MAX_DISTANCE):
       self.qualified_s = 0.0
       self.qualified_endpoint = None
@@ -234,7 +234,7 @@ class ForceStops:
       self.rearm_remaining = 0.0
       self.holding = True
       self.forcing = False
-      self.remaining = min(self.remaining, 0.0) if self.remaining > 0.0 else self.remaining
+      self.remaining = min(self.remaining, 0.0)
       self.release_filter.x = 0.0
       self.clear_window.clear()
       self._open_frames = 0
