@@ -193,8 +193,15 @@ class ForceStops:
     self.invalid_s = 0.0 if model_valid and obs.complete else self.invalid_s + self.dt
     if self.invalid_s > 0.0:
       if self.invalid_s >= MODEL_INVALID_RELEASE_S:
-        self.reset()
-        return ForceStopsResult()
+        if not self.holding:
+          self.reset()
+          return ForceStopsResult()
+        # an unhealthy model is no green, and the planner reads a hold that vanishes as a launch: the hold keeps the car, rolling
+        # or not, for as long as the model stays unhealthy (pedals and a disengage still end it above), and the healthy model's
+        # release evidence starts over, as at the hold's entry
+        self.release_filter.x = 0.0
+        self.clear_window.clear()
+        self._open_frames = 0
       return self._result(v_ego, a_prev_output)
 
     self.lead_filter.update(1.0 if obs.lead_present else 0.0)

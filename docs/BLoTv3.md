@@ -379,13 +379,22 @@ States: `idle → shaping → committed → holding → (committed | idle)`.
   −`STOP_DISTANCE` — and `holding` forces `shouldStop`, so `controlsd`'s `cruiseControl.resume` cannot pulse. Leaves to `committed` (not
   idle) at `v_ego ≥ 0.8 m/s`, so an unsigned wheel-speed flicker on a grade never drops the latch. That resume is not a
   release: the commitment carries on with the latch, and it starts its release and follow evidence over — the hold's own
-  counts and the evidence from before the stop are not this commitment's.
+  counts and the evidence from before the stop are not this commitment's. An unhealthy or incomplete model never ends a hold
+  (daily, 2026-11-08, owner ruling on review SG2; not field validated): the planner reads a hold that vanishes as a launch, and
+  the hold that ended after `MODEL_INVALID_RELEASE_S` told the car to go at the red (+0.85 m/s² 1 s into the dropout, +2.85 at
+  2 s, the stop bit down at 0.55 s, on the host). While the model stays unhealthy the hold keeps `shouldStop` and its zero cap at
+  any speed: it does not resume to `committed`, whose 0.5 s rule would end it, so a car that rolls stays in LongControl's
+  stopping state. Once the dropout reaches `MODEL_INVALID_RELEASE_S` the hold's open-path count, release filter and clear window
+  start over, as at its entry, so the healthy model releases it on its own evidence. Gas, brake and a disengage still end it at
+  once; the `commIssue` soft disable an unhealthy model raises in selfdrived ends the engagement after 3 s, except while the
+  Chestnut big model loads or settles, when selfdrived holds that alert back.
 - Release to idle: a green — a path longer than `RELEASE_OPEN_LENGTH` (`PATH_OPEN_LENGTH`, 30 m, the hold's standstill
   calibration) for `RELEASE_OPEN_FRAMES` frames with no stop evidence (`shouldStop` or strict), one test applied identically
   to a hold and to a moving commitment (a long path the model still calls a stop on is not a green). A moving commitment
   forms with the path end 40–65 m out, so at approach speed the length is always met and only the stop evidence gates the
   release (D28's cross-reference); F011's plan-physics green was built and held back (D35). Also: filtered launch evidence
-  (`stop_release_open`, 0.30 s time constant); gas; brake; a **relevant** lead; model invalid ≥ 0.5 s; the D10 fallback; the
+  (`stop_release_open`, 0.30 s time constant); gas; brake; a **relevant** lead; model invalid ≥ 0.5 s (a moving commitment
+  only, never a hold); the D10 fallback; the
   slow release (the detector below `RELEASE_THRESHOLD` with the 4 s position hold spent); a lane change (D21). Every release ends the
   commitment whole — the approach profile's anchor and the open-path count go with it, so the next commitment enters its
   ramp from the published target (D37) and its green release from zero. Fast re-entry: a lead **or** a gas tap that
@@ -489,7 +498,7 @@ ratchet and hold in one scenario; row-0 policy; single `set_weights`; `a_prev` r
 handoff frame; corridor rule with a 0.2-probability hypothesis; commit → hold → every release path;
 flickering model stop signal while holding never drops `shouldStop`; grade flicker returns to
 `committed`; lead passes through then fast re-entry; gas tap re-stop; CEM entry with a far lead;
-model hang releases within 0.5 s; pedal latency; the selfdrived hook keeps manual mode under
+model hang releases a moving commitment within 0.5 s and never a hold; pedal latency; the selfdrived hook keeps manual mode under
 override. Landing law: the corridor's shape and its request edges one actuator delay ahead, window, intent latch through a flicker, a close lead's requirement continuous in distance and never blocked, the anti-stall integral, creep floor; the planner bounds whichever candidate lands (e2e at walking pace), not above the window, and passes what a close lead needs; plant: a stopped lead, a red light and a hard close lead stop all land inside the law and still stop, and the model's late ramp (`e2e_landing_push`) is bounded with the law and not without.
 
 Added by the 2026-09-17 audit pass, by name (paths under `openpilot/selfdrive/controls/tests/` unless noted):

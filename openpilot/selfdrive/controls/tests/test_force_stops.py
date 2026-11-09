@@ -8,7 +8,7 @@ from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR
                                                            EXTEND_RATE, FOLLOW_CONFIRM_S, ForceStops, GAS_OVERRIDE_S,
                                                            LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
                                                            PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
-                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH, RELEASE_THRESHOLD)
+                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH, RELEASE_THRESHOLD, RESUME_SPEED)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -372,10 +372,56 @@ class TestHold:
     assert not result.holding and fs.forcing and result.stop_x is not None
     assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
 
-  def test_model_invalid_while_holding_is_debounced(self):
+  def test_an_unhealthy_model_never_ends_the_hold(self):
+    # the planner reads a hold that vanishes as a launch: a model failing its checks, or an incomplete one, is no green. The hold
+    # used to end after MODEL_INVALID_RELEASE_S and the car was told to go at the red (review SG2, 2026-11-08)
+    for observation, valid in ((obs(path_end=4.0), False), (StopObservation(), True), (StopObservation(), False)):
+      fs, _ = holding()
+      result = run(fs, 5.0, observation, car_state(0.0, standstill=True), valid=valid)
+      assert fs.holding and result.holding and result.v_cruise_cap == 0.0 and result.stop_x is not None
+
+  def test_after_an_unhealthy_model_the_hold_releases_on_the_healthy_models_own_evidence(self):
+    # the green, the release filter and the clear window count again from the healthy model's frames: two open frames before the
+    # dropout and one after it are no green, and a clear window nearly full before it does not release on its first frame after
+    open_road = obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False, braking=False, release_open=True, moving=True)
     fs, _ = holding()
-    assert run(fs, MODEL_INVALID_RELEASE_S - 0.1, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False).holding
-    assert not run(fs, 0.2, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False).holding
+    run(fs, (RELEASE_OPEN_FRAMES - 1) * DT_MDL, open_road, car_state(0.0, standstill=True))
+    assert fs.holding and fs.release_filter.x > 0.0
+    assert run(fs, 1.0, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False).holding
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, open_road, car_state(0.0, standstill=True)).holding
+    result = run(fs, DT_MDL, open_road, car_state(0.0, standstill=True))
+    assert not result.holding and result.stop_x is None and not fs.holding and not fs.forcing
+    ambiguous = obs(path_end=30.0, should_stop=False, braking=False, moving=True, corridor_clear=True)
+    fs, _ = holding()
+    run(fs, CLEAR_WINDOW_S - 0.2, ambiguous, car_state(0.0, standstill=True))
+    assert run(fs, 1.0, ambiguous, car_state(0.0, standstill=True), valid=False).holding
+    assert run(fs, CLEAR_WINDOW_S - 0.2, ambiguous, car_state(0.0, standstill=True)).holding
+    assert not run(fs, 0.3, ambiguous, car_state(0.0, standstill=True)).holding
+
+  def test_after_an_unhealthy_model_a_stop_the_model_still_calls_keeps_the_hold(self):
+    fs, _ = holding()
+    run(fs, 2.0, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False)
+    assert run(fs, 5.0, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_hold_that_rolls_while_the_model_is_unhealthy_stays_a_hold_until_the_model_is_back(self):
+    # conservative: the hold keeps the stop bit, so LongControl keeps braking; as a moving commitment it would end on the unhealthy
+    # model at once. With the model healthy again the hold's own resume applies: a moving commitment with the latch alive
+    fs, _ = holding()
+    run(fs, 1.0, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False)
+    result = run(fs, 1.0, obs(path_end=4.0), car_state(RESUME_SPEED + 0.5), valid=False)
+    assert result.holding and fs.holding and not fs.forcing
+    result = run(fs, DT_MDL, obs(path_end=4.0), car_state(RESUME_SPEED + 0.5))
+    assert not result.holding and fs.forcing and result.stop_x is not None
+
+  @pytest.mark.parametrize('ender', ['gas', 'brake', 'disengage'])
+  def test_pedals_and_a_disengage_still_end_a_hold_through_an_unhealthy_model(self, ender):
+    fs, _ = holding()
+    run(fs, 1.0, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False)
+    assert fs.holding
+    cs = car_state(0.0, standstill=True, gas=ender == 'gas', brake=ender == 'brake')
+    result = run(fs, DT_MDL, obs(path_end=4.0), cs, enabled=ender != 'disengage', valid=False)
+    assert not result.holding and result.stop_x is None and not fs.holding
 
   def test_fallback_release_needs_mostly_clear_moving_frames(self):
     fs, _ = holding()

@@ -7,6 +7,7 @@ import pytest
 
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from openpilot.selfdrive.controls.lib.force_stops import RELEASE_OPEN_FRAMES
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
@@ -261,6 +262,58 @@ def test_green_cannot_release_another_stop_owners_landing_or_stop_bit(owner):
     assert planner.stop_landing.landing
     assert control.long_control_state == LongCtrlState.stopping
   assert planner.anticipating  # evidence exists; it has no authority over the blocker
+
+
+def force_stops_hold():
+  planner, sm, control = LongitudinalPlanner(car_params()), messages(), LongControl(car_params())
+  set_model(sm, length=2.0)
+  plan = step(planner, sm, control, frames=40)
+  assert plan.shouldStop and planner.force_stops.holding and planner.stop_landing.landing
+  assert control.long_control_state == LongCtrlState.stopping
+  return planner, sm, control
+
+
+@pytest.mark.parametrize('mode_exit', [False, True])
+@pytest.mark.parametrize('speed', [0.0, 1.5])
+def test_an_unhealthy_model_at_a_force_stops_hold_keeps_the_car_held(speed, mode_exit):
+  # review SG2: modelV2 keeps arriving but fails its checks. The hold used to end 0.55 s in, the planner read that as a launch and
+  # told the car to go at the red (+0.85 m/s^2 at 1 s, +2.85 at 2 s). Neither a roll (a grade, a brake hold letting go) nor CEM
+  # leaving Experimental on the unhealthy model changes that the car stays held
+  planner, sm, control = force_stops_hold()
+  sm.invalid.add('modelV2')
+  sm['carState'].vEgo, sm['carState'].standstill = speed, speed == 0.0
+  sm['selfdriveState'].experimentalMode = not mode_exit
+  for _ in range(100):
+    plan = step(planner, sm, control)
+    assert plan.shouldStop and planner.force_stops.holding
+    assert control.long_control_state == LongCtrlState.stopping
+    assert plan.aTarget <= 0.0 and control.last_output_accel <= 0.0
+
+
+@pytest.mark.parametrize('green', [True, False])
+def test_a_healthy_model_after_the_dropout_judges_the_hold_as_before_it(green):
+  # back to health, a green releases the hold on its RELEASE_OPEN_FRAMES-th frame and launches the car as at a hold that never saw a
+  # dropout; a model still calling the stop keeps the car held
+  runs = []
+  for dropout in (False, True):
+    planner, sm, control = force_stops_hold()
+    if dropout:
+      sm.invalid.add('modelV2')
+      step(planner, sm, control, frames=40)
+      sm.invalid.discard('modelV2')
+    if green:
+      set_model(sm, length=60.0, accel=0.5, should_stop=False, moving=True)
+    frames = []
+    for _ in range(40):
+      plan = step(planner, sm, control)
+      frames.append((plan.shouldStop, planner.force_stops.holding, control.long_control_state == LongCtrlState.stopping, plan.aTarget > 0.0))
+    runs.append(frames)
+  assert runs[1] == runs[0]
+  if green:
+    assert all(bit and held and stopping for bit, held, stopping, _ in runs[1][:RELEASE_OPEN_FRAMES - 1])
+    assert not any(bit or held or stopping for bit, held, stopping, _ in runs[1][RELEASE_OPEN_FRAMES - 1:]) and runs[1][-1][3]
+  else:
+    assert all(bit and held and stopping and not go for bit, held, stopping, go in runs[1])
 
 
 def test_green_waits_for_urgent_min_then_releases_without_needing_a_second_path_opening():
