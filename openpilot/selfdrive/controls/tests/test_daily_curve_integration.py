@@ -303,6 +303,27 @@ def test_gas_override_preserves_reaction_then_resumes_without_stale_reset():
   assert planner.output_a_target < 0.0
 
 
+def test_gas_override_telemetry_keeps_the_policys_limit_without_claiming_a_candidate():
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  sm = curve_messages()
+  planner, admitted = run_plan(sm)
+  before = admitted['curvePolicyState'].curvePolicyState
+  assert before.active and np.isfinite(before.vLimit)
+  sm['controlsState'].longControlState = LongCtrlState.off
+  sm['carState'].gasPressed = True
+  planner.update(sm)
+  pm = Publisher()
+  planner.publish(sm, pm)
+  state = pm.messages['curvePolicyState'].curvePolicyState
+  # the candidate is withheld during the override ...
+  assert not state.active and state.aTarget == 0.0
+  assert planner.plan_winner != 'curve'
+  # ... but the log still says what the policy priced, so a pedal-driven bend can be compared with it afterwards
+  assert state.vLimit == pytest.approx(before.vLimit, rel=0.05)
+  assert state.limitDistance == pytest.approx(before.limitDistance, abs=1.0)
+  assert state.authorityFactor == pytest.approx(before.authorityFactor)
+
+
 def test_a_curve_release_hands_cruise_the_published_target_not_its_hidden_ramp():
   sm = curve_messages()
   planner, _ = run_plan(sm)

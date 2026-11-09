@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from dataclasses import replace
 import math
 import numpy as np
 
@@ -381,7 +382,9 @@ class LongitudinalPlanner:
                                               lateral_state=LateralState.from_controls_state(sm['controlsState']),
                                               gas_pressed=sm['carState'].gasPressed)
     curve_admitted = curve.a_target is not None and not reset_state
-    self.curve = curve if curve_admitted else CurveResult()
+    # Telemetry keeps the policy's own limit, regime and hold when its candidate is not admitted (a gas override, nothing
+    # to say); only the candidate is withheld, so `active` and `aTarget` still mean an admitted candidate.
+    self.curve = curve if curve_admitted else replace(curve, a_target=None)
     # Apply the upstream correction before deciding whether the model clears the committed stop's urgency margin.
     a_other = min(output_a_target_mpc, force_stop.a_target if force_stop.a_target is not None else np.inf,
                   curve.a_target if curve_admitted else np.inf)
