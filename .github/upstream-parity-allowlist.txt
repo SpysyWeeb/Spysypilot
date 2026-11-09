@@ -1,6 +1,7 @@
 # Intentional daily delta: torque/SOL, lane features, BLoTv3, ESP debounce, button features and Smooth Stops radar gate.
 .github/upstream-parity-allowlist.txt # daily dependency policy
 .gitmodules # daily dependency policy
+.github/workflows/daily-tests.yaml # daily CI: the fork's pytest suites on every push to daily
 opendbc_repo # SOL + default Hyundai 409/4/7
 openpilot/cereal/custom.capnp # SOL
 openpilot/cereal/log.capnp # SOL + BLoTv3 stop source

@@ -1,0 +1,63 @@
+name: daily tests
+
+# The fork's own tests, pytest style. Upstream's tests.yaml runs tools/op.sh test, whose unittest loader cannot collect them,
+# and it runs on pushes to master only. The steps follow the recipe that builds and tests the tree on the owner's machine.
+on:
+  push:
+    branches:
+      - daily
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: daily-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: 1
+  PYTHONPATH: ${{ github.workspace }}
+  # the 767 MB big model is not read by these tests or the build; keep every big_* model file out of the LFS pull
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: lfs.fetchexclude
+  GIT_CONFIG_VALUE_0: openpilot/selfdrive/modeld/models/big_*
+
+jobs:
+  daily-tests:
+    name: daily tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install the environment
+        run: |
+          tools/setup_dependencies.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch model files
+        run: |
+          for attempt in 1 2 3; do
+            git lfs pull && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+
+      - name: Build
+        run: scons -u -j$(nproc)
+
+      - name: Add pytest
+        # pytest is not in uv.lock; pinned to the version the fork's tests are run with
+        run: uv pip install --python .venv/bin/python pytest==9.2.0
+
+      - name: Run the fork's tests
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            openpilot/selfdrive/controls/tests \
+            openpilot/selfdrive/selfdrived/tests \
+            openpilot/selfdrive/car/tests

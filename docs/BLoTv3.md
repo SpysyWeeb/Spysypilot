@@ -668,11 +668,12 @@ Added by D45 (a lowered set speed is felt from the published target; daily only)
   `TestHoldRelease::test_a_hold_released_by_an_open_road_ends_the_landing_and_launches_from_the_kiss` and
   `test_daily_better_green_lights.py::test_a_launch_cancelled_at_creep_restores_landing_when_the_wheels_stop` fail.
 
-These unit tests run under pytest. CI's runner (`tools/test_runner.py`, a unittest loader) collects only `unittest.TestCase`
-classes, so it runs none of the 312 pytest-style unit tests in step 1's files (`test_force_stops.py` 54, `test_long_mpc.py` 160,
-`test_longitudinal_planner.py` 49, `test_stop_landing.py` 35, `test_stop_helpers.py` 14) — only the maneuver suite (59 passed and
-6 strict expected failures at the end of step 1); this predates step 1 and is the same on `combo`. It is not fixed here: run the
-controls, selfdrived and maneuver suites by hand, at both `ACCEL_MAX` pins, before any push.
+These unit tests run under pytest. Upstream's CI runner (`tools/test_runner.py`, a unittest loader, run by `tests.yaml` on pushes
+to master and on pull requests) collects only `unittest.TestCase` classes, and on the fork it fails to import every test file that
+imports pytest, which is not in `uv.lock`. Daily's own workflow, `.github/workflows/daily-tests.yaml`, runs the controls, selfdrived
+and car test folders under pytest on every push to `daily`, on pull requests and on manual dispatch, at both `ACCEL_MAX` pins where
+a test is parametrized on them. It does not run the maneuver suite or process replay: run the maneuver suite by hand, at both
+`ACCEL_MAX` pins, before any push.
 
 ## 8. Field test log
 
@@ -853,8 +854,8 @@ kept out, the hand-over residuals recorded in D32.
   requirement's one-frame let-go as a lead starts to move, the raw-radar dropout lift, and creep 0.5 re-accelerating 0.054 against
   0.05 in two gate runs. (8) After a Force Stops green, a candidate still braking below the kiss on the next frame re-latches the
   landing at rest and nothing ends it — F035's launch gap, pinned by a strict expected failure, 0 of 77–82 field standstill exits.
-  (9) The seed-switch dips at `ACCEL_MAX` 2.0 (D33). CI's unit runner runs none of the fork's 312 pytest-style unit tests (§6), so
-  a green CI on `combo` covers the maneuver suite only: run the suites by hand before any push.
+  (9) The seed-switch dips at `ACCEL_MAX` 2.0 (D33). Upstream's unit runner runs none of the fork's pytest-style unit tests (§6);
+  on `daily`, `daily-tests.yaml` runs them, but not the maneuver suite: run that suite by hand before any push.
 - **Merging to `combo`.** `combo`'s planner takes the same four edits: the speed filter removed, the landing carry removed, the
   stop-bit block (with `combo`'s whole OR, the launch assist's e2e bit included, in its `else` branch) and the `StopLanding`
   constructor. There the withheld stop bit keeps LongControl in pid through the landing, so `smooth-stops`' settle (retired 2026-09-26) no longer runs.
