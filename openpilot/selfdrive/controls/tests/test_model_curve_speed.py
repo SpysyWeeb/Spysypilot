@@ -429,7 +429,7 @@ class TestPlannerIntegration(unittest.TestCase):
 
     planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
                                                                         radarUnavailable=True, flags=0, brand=''))
-    sm = FakeSubMaster(radarState=SimpleNamespace(leadOne=SimpleNamespace(present=False)))
+    sm = FakeSubMaster(radarState=SimpleNamespace(leadOne=SimpleNamespace(present=False)), carState=SimpleNamespace(vEgo=0.0))
     sent = {}
     pm = SimpleNamespace(send=lambda service, msg: sent.__setitem__(service, msg))
     for result in (CurveResult(-1.1, REGIME_BRAKE, 21.5, 34.0, 2.6, True), CurveResult()):
@@ -443,10 +443,6 @@ class TestPlannerIntegration(unittest.TestCase):
       self.assertAlmostEqual(state.limitDistance, result.distance, places=4)
       self.assertAlmostEqual(state.authorityFactor, result.authority_factor, places=5)
       self.assertEqual(state.holding, result.holding)
-
-
-if __name__ == "__main__":
-  unittest.main()
 
 
 class TestRollHorizon(unittest.TestCase):
@@ -989,3 +985,7 @@ class TestBankContinuation(unittest.TestCase):
     plain = ModelCurveSpeedLimiter(make_cp())
     settle(plain, bend, 3, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, error=0.1, lat=2.0))
     self.assertLessEqual(plain.update(bend, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0)).a_target, 0.0)
+
+
+if __name__ == "__main__":
+  unittest.main()
