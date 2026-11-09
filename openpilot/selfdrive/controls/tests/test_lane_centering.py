@@ -1,5 +1,4 @@
 import numpy as np
-from pytest import approx
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
@@ -7,7 +6,7 @@ from openpilot.common.parameterized import parameterized
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering, get_lane_center, GAIN, LOOKAHEAD_T, MIN_LOOKAHEAD, \
-                                                            MAX_OFFSET, OFFSET_BP, SMOOTH_TAU, MAX_WIDTH_AGE, NUDGE_SETTLE
+                                                            MAX_OFFSET, OFFSET_BP, SMOOTH_TAU, MAX_WIDTH_AGE
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 X_IDXS = np.array(ModelConstants.X_IDXS)
@@ -159,18 +158,6 @@ class TestLaneCentering(OpenpilotTestCase):
     torque = float(100.0 * np.sign(toward))
     return self.run_model_frames(frames, car_state={'steeringPressed': True, 'steeringTorque': torque}, **model_kwargs)
 
-  def run_nudge(self, start, end, toward=None):
-    # the plan sits start off the lane center, the driver pushes it to end and lets go
-    self.run_model_frames(60, lane_center=start)
-    self.press(20, end - start if toward is None else toward, lane_center=end)
-    return self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=end)
-
-  def centering(self, lane_center, frames=60):
-    target = get_curvature(get_model(lane_center=lane_center))
-    curvature = self.run_model_frames(frames, lane_center=lane_center)
-    assert target != 0.0
-    return curvature == approx(target, rel=1e-3)
-
   def test_smooth(self):
     assert 0.0 < self.run_frames(DT_CTRL) < 0.05 * self.target
     np.testing.assert_allclose(self.run_frames(SMOOTH_TAU), self.target * (1 - np.exp(-1)), rtol=0.05)
@@ -200,6 +187,10 @@ class TestLaneCentering(OpenpilotTestCase):
     for _ in range(300):
       curvature = self.lane_centering.update(True, get_car_state(), model)
     np.testing.assert_allclose(curvature, 0.0, atol=1e-3 * self.target)
+    model.meta.laneChangeState = log.LaneChangeState.off
+    for _ in range(300):
+      curvature = self.lane_centering.update(True, get_car_state(), model)
+    np.testing.assert_allclose(curvature, self.target, rtol=1e-4)
 
   def test_updates_with_the_model(self):
     self.run_frames(3.0)
@@ -296,94 +287,26 @@ class TestLaneCentering(OpenpilotTestCase):
     assert np.ptp(ys[round(-20 / DT_CTRL):]) < 0.01, "does not settle"
 
   def test_closed_loop_push(self):
-    # the model holds 0.4 m left past cones and gets centered, the driver pushes left for a second: the model drives
-    # until its plan comes back to the center
-    def preferred(t):
-      return -0.4 if t < 90 else 0.0
-
+    # the model holds 0.4 m left past cones and gets centered, the driver pushes left for a second: once the wheel is
+    # released the correction takes the car back to where it held it before the push
     def push(t):
       return -0.5 if 30 <= t < 31 else 0.0
 
-    ys = self.closed_loop(150, preferred=preferred, push=push)
-    assert abs(ys[round(29 / DT_CTRL)]) < 0.1, "centered against the model"
-    assert max(abs(ys[round(t / DT_CTRL)] + 0.4) for t in (60, 89)) < 0.05, "held where the model wants"
-    assert abs(ys[-1]) < 0.05, "centered again"
+    ys = self.closed_loop(60, preferred=lambda t: -0.4, push=push)
+    centered = ys[round(29 / DT_CTRL)]
+    assert abs(centered) < 0.1, "centered against the model"
+    assert ys[round(32 / DT_CTRL)] < centered - 0.4, "pushed"
+    assert max(abs(ys[round(40 / DT_CTRL):] - centered)) < 0.05, "centered again"
 
   def test_push_the_way_the_model_leans(self):
-    # the model leans left of center and gets corrected, the driver pushes further left: the model means it
-    self.run_nudge(0.3, 0.5)
-    np.testing.assert_allclose(self.run_model_frames(600, lane_center=0.5), 0.0, atol=1e-3 * self.target)
-    # until the plan comes back near the center
-    np.testing.assert_allclose(self.run_model_frames(60, lane_center=0.2), 0.0, atol=1e-3 * self.target)
-    assert self.centering(0.1)
-    assert self.centering(0.3)
-
-  def test_yield_expires(self):
-    self.run_nudge(0.3, 0.5)
-    self.frame_id += round(110 / DT_MDL)
-    np.testing.assert_allclose(self.run_model_frames(60, lane_center=0.5), 0.0, atol=1e-3 * self.target)
-    self.frame_id += round(10 / DT_MDL)
-    assert self.centering(0.5)
-
-  @parameterized.expand([({'leftBlinker': True},), ({'rightBlinker': True},)])
-  def test_yield_ends_with_a_blinker(self, car_state):
-    self.run_nudge(0.3, 0.5)
-    self.run_model_frames(1, car_state=car_state, lane_center=0.5)
-    assert self.centering(0.5)
-
-  def test_yield_ends_on_reset(self):
-    self.run_nudge(0.3, 0.5)
-    self.lane_centering.reset()
-    assert self.centering(0.5)
-
-  def test_push_back_to_center(self):
-    self.run_nudge(0.3, 0.5)
-    self.run_nudge(0.5, 0.3)
-    assert self.centering(0.3)
-
-  def test_push_further_renews(self):
-    self.run_nudge(0.3, 0.5)
-    self.frame_id += round(110 / DT_MDL)
-    self.run_nudge(0.5, 0.7)
-    np.testing.assert_allclose(self.run_model_frames(200, lane_center=0.7), 0.0, atol=1e-3 * self.target)
-
-  @parameterized.expand([
-    (0.3, 0.1),  # toward the center
-    (0.3, -0.3),  # across it
-    (0.3, 0.35),  # barely
-    (0.1, 0.22),  # not far enough off center
-    (0.0, 0.4),  # the model did not lean
-    (0.3, 3.8),  # into the next lane
-  ])
-  def test_push_that_is_not_agreement(self, start, end):
-    self.run_nudge(start, end)
-    assert self.centering(0.5)
-
-  def test_push_in_several_presses(self):
-    # presses less than half a second apart are one push
-    self.run_model_frames(60, lane_center=0.3)
-    self.press(5, 1, lane_center=0.37)
-    self.run_model_frames(8, lane_center=0.37)
-    self.press(5, 1, lane_center=0.44)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.44)
-    np.testing.assert_allclose(self.run_model_frames(200, lane_center=0.44), 0.0, atol=1e-3 * self.target)
-
-  def test_pushes_apart_count_apart(self):
-    self.run_model_frames(60, lane_center=0.3)
-    self.press(5, 1, lane_center=0.37)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.37)
-    self.press(5, 1, lane_center=0.44)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.44)
-    assert self.centering(0.44)
-
-  def test_judged_after_the_last_press(self):
-    # the push is judged half a second after the last press, the correction comes back right away
+    # centering is on or off: the model leans left of center and gets corrected, the driver pushes further left and lets
+    # go with the plan still off center, the correction is back from the release on and stays
     self.run_model_frames(60, lane_center=0.3)
     self.press(20, 1, lane_center=0.5)
-    self.run_model_frames(8, lane_center=0.5)
-    self.press(1, 1, lane_center=0.5)
-    assert self.run_model_frames(9, lane_center=0.5) > 0.9 * get_curvature(get_model(lane_center=0.5))
-    np.testing.assert_allclose(self.run_model_frames(60, lane_center=0.5), 0.0, atol=1e-3 * self.target)
+    target = get_curvature(get_model(lane_center=0.5))
+    released = [self.run_model_frames(1, lane_center=0.5) for _ in range(round(30 / DT_MDL))]
+    assert 0.0 < released[0] < released[1] < released[2]
+    np.testing.assert_allclose(released[round(2 / DT_MDL):], target, rtol=1e-3)
 
   def test_touches_keep_centering(self):
     # a hand on the wheel costs the time it is pressed, not more
@@ -391,39 +314,3 @@ class TestLaneCentering(OpenpilotTestCase):
     for _ in range(10):
       self.press(1, 1, lane_center=0.3)
       assert self.run_model_frames(7, lane_center=0.3) > 0.9 * self.target
-
-  def test_push_needs_the_lines(self):
-    # where the push left the plan is unknown without the lines
-    self.run_model_frames(60, lane_center=0.3)
-    self.press(20, 1, lane_center=0.5)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.5, probs=(0.4, 0.4))
-    assert self.centering(0.5)
-
-  @parameterized.expand([(0,), (-1,)])
-  def test_the_model_moved_the_car(self, toward):
-    # with the correction off while the wheel is held the model takes the car its way, the driver did not push it there
-    self.run_nudge(0.3, 0.5, toward=toward)
-    assert self.centering(0.5)
-
-  def test_each_push_counts_its_own_torque(self):
-    # a long press against the model, then a short push with it
-    self.run_model_frames(60, lane_center=0.3)
-    self.press(20, -1, lane_center=0.3)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.3)
-    self.press(2, 1, lane_center=0.5)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.5)
-    np.testing.assert_allclose(self.run_model_frames(60, lane_center=0.5), 0.0, atol=1e-3 * self.target)
-
-  def test_push_after_lateral_comes_back(self):
-    # the plan the car had before lateral control went inactive is not where a push starts
-    self.run_model_frames(60, lane_center=0.3)
-    self.lane_centering.update(False, get_car_state(), get_model(lane_center=0.3, frame_id=self.frame_id))
-    self.press(20, 1, lane_center=0.5)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), lane_center=0.5)
-    assert self.centering(0.5)
-
-  def test_push_then_lane_change(self):
-    self.run_model_frames(60, lane_center=0.3)
-    self.press(20, 1, lane_center=0.5)
-    self.run_model_frames(round(NUDGE_SETTLE / DT_MDL), car_state={'leftBlinker': True}, lane_center=0.5)
-    assert self.centering(0.5)
