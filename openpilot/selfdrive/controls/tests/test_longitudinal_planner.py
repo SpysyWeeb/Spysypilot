@@ -1493,16 +1493,19 @@ class TestLeadContact:
     assert all(bit and math.isclose(a, -KISS_DECEL, abs_tol=1e-9) for _, a, _, _, bit in frames[rest:]), frames[rest:]
 
   @pytest.mark.parametrize('v_ego', [0.0, 0.3, 2.0, 15.0])
-  def test_a_lead_at_the_bumper_is_read_without_a_division_or_corridor_error(self, v_ego):
+  def test_a_lead_at_the_bumper_is_read_without_a_division_or_corridor_error(self, v_ego, monkeypatch):
     # a car standing 6 m ahead, then read at 0 m: the view holds it at 0 m and every reader's value is finite. The landing's requirement
     # for it is unbounded while the car closes on it, so the plan passes unlifted, and nothing at rest, where the corridor stands
     planner = LongitudinalPlanner(PALISADE_CP, init_v=v_ego)
+    # a failed solve resets the MPC, and the reset zeroes solution_status: record the status each reset finds instead
+    failed, reset = [], planner.mpc.reset
+    monkeypatch.setattr(planner.mpc, 'reset', lambda: (failed.append(planner.mpc.solution_status), reset()))
     for d in [6.0] * round(2.0 / DT_MDL) + [0.0]:
       planner.update(frame(v_ego, lead=(d, 0.0, 0.0), v_cruise=10.0))
     view, landing = planner.lead_kept, planner.stop_landing
     assert view.present and view.distance == 0.0, view
     values = (planner.output_a_target, planner.mpc_a_target, planner.supervisor.jerk_scale, planner.supervisor.t_follow_pad)
-    assert planner.mpc.solution_status == 0 and all(math.isfinite(x) for x in values), (planner.mpc.solution_status, values)
+    assert not failed and all(math.isfinite(x) for x in values), (failed, values)
     assert landing.lead_requirement(v_ego, view) == (math.inf if v_ego > 0.0 else 0.0)
     if landing.landing:
       assert planner.output_a_target == planner.mpc_a_target, (planner.output_a_target, planner.mpc_a_target)

@@ -27,11 +27,14 @@ def test_restored_lead_discards_free_run_change_cost_through_the_reanchor(monkey
     original(cost_weights, constraint_weights)
 
   monkeypatch.setattr(planner.mpc, 'set_cost_weights', record)
+  # a failed solve resets the MPC, and the reset zeroes solution_status: record the status each reset finds instead
+  failed, reset = [], planner.mpc.reset
+  monkeypatch.setattr(planner.mpc, 'reset', lambda: (failed.append(planner.mpc.solution_status), reset()))
   for _ in range(LEAD_PRESENCE_FRAMES + 1):
     planner.update(frame(12.0, 0.0, 40.0, 11.0, y_ego=1.5, path=2.0, blinker=False))
     assert not any(planner.lane_change_gap.released)
     assert mpc_follows(planner, 40.0, 11.0)
-    assert planner.mpc.solution_status == 0
+    assert not failed, failed
   assert [weights[4] for weights, _ in costs[:-1]] == [0.0] * LEAD_PRESENCE_FRAMES
   assert costs[-1][0][4] > 0.0
   assert all(weights[5] > 0.0 for weights, _ in costs)  # jerk cost still owns the transition
