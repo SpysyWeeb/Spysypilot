@@ -18,7 +18,9 @@ uses the original reserved-1 struct ID. `lateralTorqueParameters` is optional fo
 message validity, but consumed only when its individual alive/frequency/valid
 checks and `useParams` pass. A gas override does not reset the policy. A genuine
 disengagement or unhealthy model message clears dynamic curve authority; telemetry
-marks a candidate active only when admitted. A malformed path clears stale
+marks a candidate active only when admitted, and still logs the policy's limit when
+none is: during a gas override and while not engaged (logging only, see 2026-11-08
+below). A malformed path clears stale
 anticipation/history and its release ramp, while fresh measured understeer can
 still request reaction braking. The planner's ordinary handover preserves output
 continuity on that release. A nonfinite or unreadable auxiliary roll uses neutral
@@ -371,3 +373,23 @@ intended. The heavy guard: acceleration at or above 0.3 m/s² with the torque at
 candidate where none exists. Still unmeasured: ride feel (the replay is open loop, the sims use predicted torque), any
 engaged right-angle turn at 5.4 m/s (none logged), wet roads, and whether the rack holds the 2.45–2.63 m/s² share the
 commute limit now asks. Not driven.
+
+## 2026-11-08 — the log says what the policy priced when it is not in the plan
+
+The owner's planned curve drives (openpilot steering, his own foot on the pedals, to find the limits) would have logged
+nothing to compare with: whenever the candidate was not admitted the planner published a blank `curvePolicyState` (regime
+`free`, `vLimit` inf, authority 0), and while not engaged it did not run the policy at all. Now:
+
+- **During a gas override** the policy runs as before, and the log carries its own regime, limit, distance, authority factor
+  and hold; only the candidate is withheld, so `active` and `aTarget` still mean an admitted candidate.
+- **While not engaged** (`selfdriveState.enabled` false: Sometimes-On-Lateral steering with the driver on the pedals, or
+  driving by hand) with a healthy model message, `ModelCurveSpeedLimiter.shadow()` prices the current path for the current
+  lateral state exactly as `update()` would: the budget with the calibrated authority (the tuning's own before the first
+  calibration) while openpilot steers and the driver does not, comfort alone otherwise. The log carries that limit, its
+  distance and the authority factor, with `active` false, `aTarget` 0, regime `free` and no hold. An unhealthy model message
+  or a malformed path logs no limit (`vLimit` inf).
+
+Logging only. The shadow makes no candidate, learns no authority, seeds no filter and leaves every regime, dwell, hold,
+history and jerk-anchor state as it was, so an engagement starts exactly as it would have without it
+(`test_daily_curve_integration.py`: an engagement after a shadowed stretch matches one after an unshadowed stretch frame for
+frame). The authority still calibrates only while engaged: a pedal-driven bend teaches it nothing. Not field validated.

@@ -1,11 +1,16 @@
 """Exercise the real daily planner/MPC and serialized outputs, not a policy-only min()."""
+import copy
+import math
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
-from openpilot.selfdrive.controls.tests.test_model_curve_speed import make_cp, make_model, settle, tracking
+from openpilot.selfdrive.controls.lib.model_curve_speed import CurveResult, ModelCurveSpeedLimiter
+from openpilot.selfdrive.controls.tests.test_model_curve_speed import FACTOR, make_cp, make_model, settle, tracking
 from openpilot.selfdrive.controls.tests.test_daily_blotv3_integration import PlannerMessages, car_params
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -336,3 +341,157 @@ def test_a_curve_release_hands_cruise_the_published_target_not_its_hidden_ramp()
     assert 0.0 <= planner.output_a_target - previous <= 0.151
   assert planner.plan_winner == 'cruise'
   assert not planner.output_should_stop
+
+
+def disengage(sm, enabled=False):
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  sm['selfdriveState'].enabled = enabled
+  sm['controlsState'].longControlState = LongCtrlState.pid if enabled else LongCtrlState.off
+
+
+def steer(sm, output, actual, desired):
+  st = sm['controlsState'].lateralControlState.torqueState
+  st.output, st.actualLateralAccel, st.desiredLateralAccel, st.error = output, actual, desired, desired - actual
+
+
+def limiter_snapshot(limiter):
+  # every attribute update() can change, the authority filter's own state included (data only: a patched method is no state)
+  snapshot = copy.deepcopy({name: value for name, value in vars(limiter).items() if name != 'authority' and not callable(value)})
+  snapshot['authority'] = None if limiter.authority is None else dict(vars(limiter.authority))
+  return snapshot
+
+
+def plan_outputs(planner):
+  return (float(planner.output_a_target), bool(planner.output_should_stop), planner.plan_winner, planner.plan_source,
+          float(planner.a_cruise), tuple(planner.v_desired_trajectory), tuple(planner.a_desired_trajectory))
+
+
+@pytest.mark.parametrize('steering', ['sol', 'hand_on_wheel', 'by_hand'])
+def test_not_engaged_telemetry_prices_the_path_as_the_engaged_policy_would(steering):
+  # the owner on the pedals with openpilot steering, the same with a hand on the wheel, or driving by hand: the log says what
+  # the policy would price for that same lateral state, and claims no candidate
+  sm = curve_messages()
+  if steering == 'hand_on_wheel':
+    sm['carState'].steeringPressed = True
+  elif steering == 'by_hand':
+    sm['carControl'].latActive = False
+    sm['controlsState'].lateralControlState.torqueState.active = False
+  _, engaged = run_plan(sm)
+  expected = engaged['curvePolicyState'].curvePolicyState
+  assert expected.active and np.isfinite(expected.vLimit)
+  disengage(sm)
+  planner, messages = run_plan(sm)
+  state = messages['curvePolicyState'].curvePolicyState
+  assert not state.active and state.aTarget == 0.0 and state.regime == 'free' and not state.holding
+  assert state.vLimit == pytest.approx(expected.vLimit, rel=1e-6)
+  assert state.limitDistance == pytest.approx(expected.limitDistance)
+  assert state.authorityFactor == pytest.approx(expected.authorityFactor)
+  assert planner.plan_winner != 'curve' and planner.curve.a_target is None
+
+
+def test_not_engaged_telemetry_follows_the_lateral_state_it_would_be_priced_for():
+  # openpilot steering prices the budget; the driver's own steering prices comfort alone, exactly as update() does
+  sol = curve_messages()
+  by_hand = curve_messages()
+  by_hand['carControl'].latActive = False
+  limits = []
+  for sm in (sol, by_hand):
+    disengage(sm)
+    limits.append(run_plan(sm)[1]['curvePolicyState'].curvePolicyState.vLimit)
+  assert limits[0] < limits[1]
+
+
+def test_shadow_evaluation_prices_the_path_and_changes_nothing_update_carries():
+  bend = make_model(20.0, np.full(ModelConstants.IDX_N, 0.03))
+  teaching = tracking(torque=0.9, error=0.1, lat=3.1)            # at the budget and tracking: update() learns from it
+  heavy = tracking(torque=1.0, error=1.0, lat=2.0, desired=3.0)  # pinned and understeering: the brake regime
+  kwargs = {'v_ego': 20.0, 'lateral_active': True}
+  fresh = ModelCurveSpeedLimiter(make_cp())
+  limiter = ModelCurveSpeedLimiter(make_cp())
+  settle(limiter, bend, 200, a_ego=-1.0, lateral_state=teaching, **kwargs)
+  limiter.update(bend, a_ego=-1.0, lateral_state=heavy, gas_pressed=True, **kwargs)
+  settle(limiter, bend, 20, a_ego=-1.0, lateral_state=heavy, **kwargs)
+  assert limiter.regime == 'brake' and limiter.authority.x > FACTOR and limiter._gas_grace_s > 0.0
+  live = SimpleNamespace(latAccelFactorFiltered=3.0, latAccelOffsetFiltered=0.0, frictionCoefficientFiltered=0.11)
+  variants = [(bend, teaching, kwargs), (bend, heavy, kwargs), (bend, teaching, {**kwargs, 'steering_pressed': True}),
+              (bend, teaching, {**kwargs, 'roll': float('nan')}), (bend, teaching, {**kwargs, 'torque_params': live}),
+              (bend, teaching, {**kwargs, 'v_ego': float('nan')}), (make_model(20.0), teaching, kwargs), (None, teaching, kwargs)]
+  for policy in (fresh, limiter):
+    before = limiter_snapshot(policy)
+    for model, state, extra in variants:
+      result = policy.shadow(model, lateral_state=state, **extra)
+      assert result.a_target is None and result.regime == 'free' and not result.holding
+      assert limiter_snapshot(policy) == before
+  assert fresh.authority is None                                  # nothing seeded either
+  # the price is update()'s own for the same path and lateral state (a state that teaches nothing, so both use one factor)
+  for policy in (fresh, limiter):
+    shadow = policy.shadow(bend, lateral_state=tracking(), **kwargs)
+    engaged = copy.deepcopy(policy).update(bend, a_ego=-1.0, lateral_state=tracking(), **kwargs)
+    assert math.isfinite(shadow.v_limit)
+    assert (shadow.v_limit, shadow.distance, shadow.authority_factor) == (engaged.v_limit, engaged.distance, engaged.authority_factor)
+  assert fresh.shadow(bend, lateral_state=tracking(), **kwargs).authority_factor == pytest.approx(FACTOR)
+  assert limiter.shadow(bend, lateral_state=tracking(), **kwargs).authority_factor == pytest.approx(limiter.authority.x)
+
+
+def test_not_engaged_frames_leave_the_next_engagement_frame_for_frame_unchanged():
+  sms = [curve_messages(0.03), curve_messages(0.03)]
+  planners = [LongitudinalPlanner(car_params(), init_v=20.0) for _ in sms]
+
+  def step():
+    published = []
+    for planner, sm in zip(planners, sms, strict=True):
+      planner.update(sm)
+      pm = Publisher()
+      planner.publish(sm, pm)
+      published.append(pm.messages['curvePolicyState'].curvePolicyState)
+    return published
+
+  # the second planner never runs the shadow
+  with patch.object(planners[1].curve_speed_limiter, 'shadow', return_value=CurveResult()):
+    for sm in sms:
+      steer(sm, 0.9, 3.1, 3.15)                                  # at the budget and tracking: an engaged frame learns from it
+    for _ in range(100):
+      step()
+    authority = planners[0].curve_speed_limiter.authority.x
+    assert authority > FACTOR
+    for sm in sms:
+      disengage(sm)                                              # openpilot keeps steering the bend, the driver has the pedals
+    for _ in range(60):
+      shadowed, blank = step()
+      assert np.isfinite(shadowed.vLimit) and not shadowed.active   # the shadow ran ...
+      assert math.isinf(blank.vLimit)                                 # ... in the first planner only
+      assert plan_outputs(planners[0]) == plan_outputs(planners[1])
+      assert limiter_snapshot(planners[0].curve_speed_limiter) == limiter_snapshot(planners[1].curve_speed_limiter)
+    assert planners[0].curve_speed_limiter.authority.x == authority
+    for sm in sms:
+      disengage(sm, enabled=True)
+      steer(sm, 1.0, 2.0, 3.0)                                   # pinned and understeering: the brake regime, then a hold
+    for frame in range(80):
+      if frame == 40:
+        for sm in sms:
+          steer(sm, 0.3, 2.0, 2.05)
+      shadowed, blank = step()
+      assert planners[0].curve == planners[1].curve
+      assert plan_outputs(planners[0]) == plan_outputs(planners[1])
+      assert shadowed.to_dict() == blank.to_dict()
+      assert limiter_snapshot(planners[0].curve_speed_limiter) == limiter_snapshot(planners[1].curve_speed_limiter)
+    assert planners[0].curve.a_target is not None
+
+
+@pytest.mark.parametrize('fault', ['unhealthy', 'shape', 'nonfinite'])
+def test_not_engaged_telemetry_keeps_no_stale_limit_without_a_usable_path(fault):
+  sm = curve_messages()
+  disengage(sm)
+  planner, messages = run_plan(sm)
+  assert np.isfinite(messages['curvePolicyState'].curvePolicyState.vLimit)
+  if fault == 'unhealthy':
+    sm.invalid.add('modelV2')
+  else:
+    sm['modelV2'].orientationRate.z = [] if fault == 'shape' else [float('nan')] * ModelConstants.IDX_N
+  planner.update(sm)
+  pm = Publisher()
+  planner.publish(sm, pm)
+  state = pm.messages['curvePolicyState'].curvePolicyState
+  assert math.isinf(state.vLimit) and state.limitDistance == 0.0
+  assert not state.active and state.regime == 'free' and not state.holding
+  assert planner.plan_winner != 'curve'

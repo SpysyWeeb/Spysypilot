@@ -381,6 +381,13 @@ class LongitudinalPlanner:
                                               torque_params=get_live_torque_params(sm),
                                               lateral_state=LateralState.from_controls_state(sm['controlsState']),
                                               gas_pressed=sm['carState'].gasPressed)
+    else:
+      # not engaged (the driver on the pedals, openpilot steering or not): the log still says what the policy would price
+      # here. Logging only: no candidate, and nothing is learned or carried into the next engagement
+      curve = self.curve_speed_limiter.shadow(sm['modelV2'], v_ego=v_ego, lateral_active=sm['carControl'].latActive,
+                                              steering_pressed=sm['carState'].steeringPressed, roll=sm['vehicleParameters'].roll,
+                                              torque_params=get_live_torque_params(sm),
+                                              lateral_state=LateralState.from_controls_state(sm['controlsState']))
     curve_admitted = curve.a_target is not None and not reset_state
     # Telemetry keeps the policy's own limit, regime and hold when its candidate is not admitted (a gas override, nothing
     # to say); only the candidate is withheld, so `active` and `aTarget` still mean an admitted candidate.

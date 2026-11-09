@@ -323,7 +323,13 @@ class ModelCurveSpeedLimiter:
         and state.torque > friction + AUTHORITY_MIN_TORQUE_OVER_FRICTION):
       measured = share / (state.torque - friction)
       self.authority.update(float(np.clip(measured, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)))
-    return (float(np.clip(self.authority.x, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)), offset, friction)
+    return self._priced_authority(params)
+
+  def _priced_authority(self, params):
+    # the authority the limits count on: the calibrated factor (the tuning's own before the first calibration), in its bounds
+    factor, offset, friction = params
+    learned = self.authority.x if self.authority is not None else factor
+    return (float(np.clip(learned, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)), offset, friction)
 
   def _anticipate(self, model, v_ego, roll, params, lateral_active):
     try:
@@ -434,6 +440,37 @@ class ModelCurveSpeedLimiter:
       v_ok = math.sqrt(a_lat_ok / max(curvature_now, MIN_CURVATURE))
       return max(min(accel_coast, 0.0, (v_ok - v_ego) / T_RESTORE), floor_approach)
     return A_CURVE_FREE
+
+  def shadow(self, model, v_ego=0.0, lateral_active=False, steering_pressed=False, roll=0.0, torque_params=None,
+             lateral_state=None):
+    """For the log while the policy is not engaged: what update() would price for this path and lateral state (the strictest
+    node's limit, its distance, the authority factor), never a candidate. It learns no authority, seeds no filter and leaves
+    every regime, dwell, hold, history and jerk-anchor state as it was, so the next engagement starts exactly as without it."""
+    try:
+      roll = float(roll)
+    except (TypeError, ValueError, OverflowError):
+      roll = math.nan
+    if not math.isfinite(roll):
+      roll = 0.0
+    try:
+      v_ego = float(v_ego)
+    except (TypeError, ValueError, OverflowError):
+      return CurveResult()
+    if not math.isfinite(v_ego):
+      return CurveResult()
+    v_ego = max(v_ego, 0.0)
+    state = lateral_state if lateral_state is not None else LateralState()
+    steering = lateral_active and state.active and not steering_pressed
+    live = _torque_values(torque_params) if torque_params is not None else None
+    params = live or self.torque_params
+    params = self._priced_authority(params) if params is not None else None
+    kept = self.v_limit, self.distance
+    try:
+      path_valid = self._anticipate(model, v_ego, roll, params, steering) is not None
+      v_limit, distance = (self.v_limit, self.distance) if path_valid else (math.inf, 0.0)
+    finally:
+      self.v_limit, self.distance = kept   # _anticipate records the node for update(); the shadow keeps nothing
+    return CurveResult(None, REGIME_FREE, v_limit, distance, params[0] if params is not None else 0.0)
 
   def update(self, model, v_ego=0.0, a_ego=0.0, lateral_active=False, steering_pressed=False, roll=0.0, accel_coast=-0.3,
              torque_params=None, lateral_state=None, gas_pressed=False):
