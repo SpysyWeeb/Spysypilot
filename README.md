@@ -2,6 +2,8 @@
 
 A minimal-diff personal branch on the official master baseline (code as of the Mountain Dew release), with the Chestnut big model pinned to Cinque v3 (see the Chestnut section). Experimental controller changes remain subject to owner/device/field validation; local tests are not a driving-safety qualification.
 
+**This is the owner's daily-driver branch** as of 2026-11-08: the one installed on the car day to day. [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) is the combined testing branch.
+
 ## Selected features
 
 - **Torque + SOL:** default classic-Hyundai 409 / +4 / -7 envelope, retaining existing lower-limit/CAN-FD exceptions and paired safety. SOL provides independent lateral operation, fault/freshness and monitoring integration. Driver steering caps an available SOL torque request by the platform's own driver-allowance envelope: the request keeps full authority while the driver pushes with it and is floored at +/-0.5 while the driver opposes it; smaller ordinary requests stay smaller, and downstream limits still apply (not field validated).
