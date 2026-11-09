@@ -6,6 +6,8 @@ It's a personal side project for SpysyWeeb. It is **not meant for others to use*
 
 Any and all code and features generated in this project are free for others to use. SpysyWeeb doesn't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
 
+**Daily driver:** as of 2026-11-08 the owner drives the [`daily`](https://github.com/SpysyWeeb/Spysypilot/tree/daily) branch, not `combo`. This README describes `combo`, the combined testing branch.
+
 This branch keeps the existing model-path curve speed limiter and adds a
 Palisade-only future-torque envelope. Valid torque parameters can lower the
 future curve speed before the unchanged approach-distance calculation; the
@@ -19,6 +21,7 @@ and remaining validation work.
 
 - **`stock`** — clean commaai/openpilot base, no changes
 - **`combo`** — all features merged together for testing
+- **[`daily`](https://github.com/SpysyWeeb/Spysypilot/tree/daily)** — the owner's daily driver as of 2026-11-08: the branch installed on the car day to day; its own README lists what it carries
 - Feature branches are cut from `stock` and merged into `combo` when ready; each feature branch's own README explains that feature in depth
 
 ### Integration branch
