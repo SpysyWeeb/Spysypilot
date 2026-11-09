@@ -10,7 +10,7 @@ from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, Lan
                                                               LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LEAD_UNPLACED_STD,
                                                               LEAD_UNPLACED_STD_HOLD, LINE_HOLD, LINE_OFFSET_MIN, MIN_HEADROOM,
                                                               RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MIN_DISTANCE, TRACK_MOVING_SPEED,
-                                                              too_close)
+                                                              inputs_valid, too_close)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LaneChangeState = log.LaneChangeState
@@ -480,18 +480,22 @@ class TestLeadRelease:
     step(gap, model=get_model(path=None), radar_state=radar_state, n=5)
     assert released(gap) == [False, False]
 
-  def test_path_turning_back_is_read_out_to_its_farthest_point(self):
+  def test_path_turning_back_disables_passing(self):
     # a left turn at a junction taken as a change: the path runs round a 20 m radius until it heads back toward the car,
-    # and a car turning ahead sits on it 70 degrees round
+    # and a car turning ahead sits on it 70 degrees round. A path whose distance stops growing is no clearance, so the
+    # input check ends the policy before any lead is judged against it
     radius, turned = 20.0, np.radians(70.0)
     arc = np.linspace(0.0, 0.75 * np.pi, len(X_IDXS))
     model = get_model()
     model.position.x = (radius * np.sin(arc)).tolist()
     model.position.y = (-radius * (1 - np.cos(arc))).tolist()
     radar_state = get_radar_state(d_rel=float(radius * np.sin(turned)) - RADAR_TO_CAMERA, y_rel=float(radius * (1 - np.cos(turned))), v_rel=-0.5, v_ego=6.0)
+    CS, tracks = get_car_state(), get_tracks()
+    assert not inputs_valid(model, CS, radar_state, tracks, 6.0, V_EGO + 5.0)
     gap = LaneChangeGap(CP, DT_MDL)
-    step(gap, model=model, radar_state=radar_state, v_ego=6.0, n=5)
-    assert released(gap) == [False, False]
+    assert step(gap, model=model, CS=CS, radar_state=radar_state, tracks=tracks, v_ego=6.0, n=5) == 0.0
+    assert released(gap) == [False, False] and not gap.accelerate
+    assert gap.followed(radar_state) is radar_state
 
   def test_stopped_or_crawling_lead_is_never_released(self):
     # in town a crawling car 100 m out asks the MPC for little braking, so only its own speed keeps it followed
