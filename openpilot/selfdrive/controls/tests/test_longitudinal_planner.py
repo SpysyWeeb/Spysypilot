@@ -1,5 +1,6 @@
 import math
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -419,6 +420,37 @@ class TestCommittedProfileArbitration:
       if steps or car.planner.force_stops.forcing:
         steps.append(car.a - told)
     assert len(steps) == round(3.0 / DT_MDL) and min(steps) >= -e2e_jerk * DT_MDL - 1e-6, min(steps)
+
+
+class TestSlowingApproachIsCemsAlone:
+  # D47: below 13 m/s a slowing, straight, braking plan is CEM's entry evidence (`StopObservation.slowing_approach`). The planner,
+  # Force Stops and the landing read the same observation and must not see it: with the field hidden from one of two planners, both
+  # publish the same plan through route 0x1ef's creeping red light (the plan ending at 1.8 m/s, the model's request falling through -0.25)
+  @staticmethod
+  def creeping(i, experimental):
+    sm = frame(10.0, experimental=experimental, e2e_accel=-0.10 - 0.02 * i, path=(60.0 - 0.5 * i, 1.8), standstill=False)
+    sm['modelV2'].orientation.z = [0.0] * ModelConstants.IDX_N
+    return sm
+
+  @pytest.mark.parametrize('experimental', [False, True])
+  def test_the_planner_and_force_stops_do_not_read_it(self, experimental):
+    observe = longitudinal_planner.observe_model_stop
+    seen, hidden = LongitudinalPlanner(PALISADE_CP, init_v=10.0), LongitudinalPlanner(PALISADE_CP, init_v=10.0)
+    readings, committed = [], False
+    for i in range(60):
+      sm = self.creeping(i, experimental)
+      readings.append(observe(sm['modelV2'], sm['carState'], sm['radarState']).slowing_approach)
+      seen.update(sm)
+      with patch.object(longitudinal_planner, 'observe_model_stop', lambda *args: replace(observe(*args), slowing_approach=False)):
+        hidden.update(self.creeping(i, experimental))
+      assert (seen.output_a_target, seen.output_should_stop, seen.plan_winner, seen.stop_landing.landing) == \
+             (hidden.output_a_target, hidden.output_should_stop, hidden.plan_winner, hidden.stop_landing.landing), i
+      assert (seen.force_stops.forcing, seen.force_stops.holding, seen.force_stops.remaining) == \
+             (hidden.force_stops.forcing, hidden.force_stops.holding, hidden.force_stops.remaining), i
+      committed |= seen.force_stops.forcing
+    assert not any(readings[:8]) and all(readings[8:])
+    # in Experimental Force Stops acts on this approach, so the comparison covers its commitment too
+    assert committed == experimental
 
 
 class TestStopLanding:

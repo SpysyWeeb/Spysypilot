@@ -65,6 +65,7 @@ class StopObservation:
   lane_change: bool = False     # the model is changing lanes: its endpoint is about to belong to another lane
   slowing: bool = False         # the plan's low point sheds most of the car's speed, wherever the plan ends
   lead_owns_stop: bool = False  # a relevant lead is a queue, or a lead cannot be read (lead_owns_stop below)
+  slowing_approach: bool = False  # below STOP_EARLY_MIN_SPEED: slowing, straight, toward a point ahead, the model braking (D47; CEM entry only)
 
 
 def _finite(values):
@@ -157,6 +158,10 @@ def observe_model_stop(model, car_state, radar_state):
                 and terminal_speed <= min(STOP_EARLY_TERMINAL_SPEED_MAX, v_ego * STOP_EARLY_TERMINAL_SPEED_RATIO))
   early_hint = (v_ego >= STOP_EARLY_MIN_SPEED and straight and 0.0 < path_end <= v_ego * STOP_EARLY_HINT_HORIZON_S
                 and terminal_speed <= v_ego * STOP_EARLY_HINT_TERMINAL_SPEED_RATIO and desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX)
+  # below the early tiers' speed a plan that slows toward a point ahead may still end above the strict tier's 1.0 m/s, creeping on
+  # past its low point (route 0x1ef t=209.3-213.9: no tier read a red light). Not a tier: CEM alone reads it, as entry evidence (D47)
+  slowing_approach = (v_ego < STOP_EARLY_MIN_SPEED and slowing and straight and path_end > 0.0
+                      and desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX)
 
   if action.shouldStop:
     confidence = STOP_DIRECT_CONFIDENCE
@@ -177,7 +182,7 @@ def observe_model_stop(model, car_state, radar_state):
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
                          relevant, lead_present(radar_state), committed_turn, stop_release_open(model),
                          path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing,
-                         relevant and lead_owns_stop(radar_state, v_ego, path_end))
+                         relevant and lead_owns_stop(radar_state, v_ego, path_end), slowing_approach)
 
 
 def lane_changing(model):

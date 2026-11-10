@@ -4,8 +4,9 @@ from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import ConditionalExperimentalMode
-from openpilot.selfdrive.controls.tests.test_conditional_experimental_mode import (TICKS_PER_FRAME, YELLOW_LIGHT_SPEED, model,
-                                                                                   yellow_light_lead, yellow_light_stop)
+from openpilot.selfdrive.controls.tests.test_conditional_experimental_mode import (LOW_SPEED_APPROACH, TICKS_PER_FRAME, YELLOW_LIGHT_SPEED,
+                                                                                   creeping_stop, model, red_light_request, yellow_light_lead,
+                                                                                   yellow_light_stop)
 from openpilot.selfdrive.selfdrived.selfdrived import SelfdriveD
 
 
@@ -80,3 +81,23 @@ def test_a_yellow_light_the_lead_goes_through_requests_experimental():
     sd.sm.updated['modelV2'] = tick % TICKS_PER_FRAME == 0
     SelfdriveD.update_experimental_mode(sd, cs)
   assert sd.experimental_mode
+
+
+def test_a_creeping_red_light_with_no_car_ahead_requests_experimental():
+  # route 0x1ef t=210.5 (2026-11-09, D47): at 10 m/s with no lead, the plan dipping to a walking pace and creeping on above 1 m/s while
+  # the model's request falls through -0.25 on the ninth frame; Experimental is requested within the hint tier's filter and debounce
+  data = {'modelV2': model(), 'radarState': messaging.new_message('radarState').radarState}
+  sd = selfdrived(False, False, data=data)
+  sd.conditional_experimental_mode = ConditionalExperimentalMode()
+  cs = messaging.new_message('carState').carState
+  cs.vEgo = LOW_SPEED_APPROACH
+  requested = None
+  for tick in range(round(1.5 / DT_CTRL)):
+    i = tick // TICKS_PER_FRAME
+    data['modelV2'] = creeping_stop(i, desired_accel=red_light_request(i))
+    sd.sm.updated['modelV2'] = tick % TICKS_PER_FRAME == 0
+    SelfdriveD.update_experimental_mode(sd, cs)
+    if sd.experimental_mode and requested is None:
+      requested = tick * DT_CTRL
+  # the first braking frame is the ninth (0.40 s); the filter and the debounce take 0.60 s more
+  assert requested is not None and 0.95 <= requested <= 1.05

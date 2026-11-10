@@ -4,9 +4,10 @@ import math
 
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.stop_helpers import (LEAD_CRAWL_SPEED, STOP_DIRECT_CONFIDENCE, STOP_EARLY_CONFIDENCE,
-                                                           STOP_EARLY_HINT_CONFIDENCE, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
-                                                           STOP_TRAJECTORY_CONFIDENCE, lead_owns_stop, leads_clear_of_stop_path,
-                                                           observe_model_stop, stop_release_open)
+                                                           STOP_EARLY_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_CONFIDENCE,
+                                                           STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
+                                                           STOP_EARLY_MIN_SPEED, STOP_TRAJECTORY_CONFIDENCE, lead_owns_stop,
+                                                           leads_clear_of_stop_path, observe_model_stop, stop_release_open)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
@@ -241,3 +242,41 @@ class TestSlowing:
     assert not observe(speeds(model(path_end=0.5), 0.0, -0.05, 0.0), car_state(0.0)).slowing
     assert not observe(speeds(model(path_end=60.0), 6.0, 6.0, 12.0), car_state(6.0)).slowing
     assert not observe(messaging.new_message('modelV2').modelV2).slowing
+
+
+def creeping(v_ego=10.0, low=0.5, end=1.8, path_end=45.0, desired_accel=-0.5, **kwargs):
+  # route 0x1ef t=210.5-213.9: the plan dips to a walking pace and creeps on above the strict tier's 1.0 m/s, the model braking
+  return speeds(model(path_end=path_end, terminal_speed=end, desired_accel=desired_accel, **kwargs), v_ego, low, end)
+
+
+class TestSlowingApproach:
+  # D47: below STOP_EARLY_MIN_SPEED, a slowing plan on a straight approach to a point ahead with the model asking at least the hint
+  # tier's braking. CEM reads it as entry evidence; no tier, confidence or other field moves, so Force Stops and the planner see what
+  # they saw
+  def test_a_creeping_red_light_below_the_early_tier_reads_as_a_slowing_approach_and_nothing_else(self):
+    for desired_accel in (STOP_EARLY_HINT_DESIRED_ACCEL_MAX, -0.53, -1.8):
+      obs = observe(creeping(desired_accel=desired_accel), car_state(10.0))
+      assert obs.slowing_approach and obs.slowing
+      assert obs.confidence == 0.0 and not (obs.should_stop or obs.strict_stop or obs.early_stop)
+      assert obs.braking == (desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX)
+    assert observe(creeping(v_ego=5.0), car_state(5.0)).slowing_approach
+    assert observe(creeping(v_ego=STOP_EARLY_MIN_SPEED - 0.1), car_state(STOP_EARLY_MIN_SPEED - 0.1)).slowing_approach
+
+  def test_each_condition_is_needed(self):
+    assert not observe(creeping(desired_accel=STOP_EARLY_HINT_DESIRED_ACCEL_MAX + 0.01), car_state(10.0)).slowing_approach
+    assert not observe(creeping(desired_accel=float('nan')), car_state(10.0)).slowing_approach
+    assert not observe(creeping(), car_state(10.0, blinker=True)).slowing_approach
+    assert not observe(creeping(curvature=0.011), car_state(10.0)).slowing_approach
+    assert not observe(creeping(heading=math.radians(25.0)), car_state(10.0)).slowing_approach
+    assert not observe(creeping(low=4.0, end=4.5), car_state(10.0)).slowing_approach
+    assert not observe(creeping(path_end=0.0), car_state(10.0)).slowing_approach
+    for v_ego in (STOP_EARLY_MIN_SPEED, 14.0):
+      assert not observe(creeping(v_ego=v_ego), car_state(v_ego)).slowing_approach
+    assert not observe(messaging.new_message('modelV2').modelV2).slowing_approach
+
+  def test_it_is_read_whatever_the_leads_and_tiers(self):
+    # the lead veto and the tiers are CEM's to apply; the reading itself is the plan's
+    obs = observe(creeping(), car_state(10.0), radar_state(d_one=25.0, v_one=8.0))
+    assert obs.slowing_approach and obs.relevant_lead
+    obs = observe(creeping(end=0.5, path_end=30.0), car_state(10.0))
+    assert obs.slowing_approach and obs.strict_stop and obs.confidence == STOP_TRAJECTORY_CONFIDENCE

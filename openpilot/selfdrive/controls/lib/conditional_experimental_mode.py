@@ -1,9 +1,9 @@
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present
-from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE, STOP_SAMPLE_MIN_CONFIDENCE,
-                                                           STOP_TRAJECTORY_CONFIDENCE, StopObservation, model_complete_and_finite,
-                                                           observe_model_stop)
+from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
+                                                           STOP_SAMPLE_MIN_CONFIDENCE, STOP_TRAJECTORY_CONFIDENCE, StopObservation,
+                                                           model_complete_and_finite, observe_model_stop)
 
 # Requests Experimental mode for a confirmed model stop that no lead owns so the e2e candidate can plan the
 # approach; it never chooses a speed, an acceleration, a brake command or a stop point.
@@ -105,7 +105,13 @@ class ConditionalExperimentalMode:
       self._lead_release_active = True
     entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or obs.committed_turn
 
-    confidence = obs.confidence if self.experimental_mode or not entry_veto else 0.0
+    evidence = obs.confidence
+    if not self.experimental_mode and obs.slowing_approach:
+      # below the early tiers' speed, a slowing, straight plan with the model braking enters at the hint's confidence (D47). It is no
+      # near stop, so a relevant lead vetoes it, and it is entry evidence only: below the hold's 0.8 it could not refresh the hold of
+      # an active mode either, and every frame carrying it is slowing, which holds the mode below
+      evidence = max(evidence, STOP_EARLY_HINT_ENTRY_CONFIDENCE)
+    confidence = evidence if self.experimental_mode or not entry_veto else 0.0
     if self.experimental_mode and obs.slowing:
       # a plan still shedding most of the speed has not reached the stop, even when it relaunches before its end:
       # trajectory evidence, so neither the hold nor the clear hysteresis runs out and the open-road count cannot start
