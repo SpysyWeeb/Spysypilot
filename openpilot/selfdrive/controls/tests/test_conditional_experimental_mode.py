@@ -354,24 +354,25 @@ class TestSlowingAndGo:
 
 
 def through_lead():
-  # a lead going through the stop: 25 m ahead at 10 m/s, it comes to rest past stop_model()'s 30 m stop point
+  # a lead going through the stop: 25 m ahead at 10 m/s
   return radar_state(d_one=25.0, v_one=10.0)
 
 
 class TestLeadOwnership:
   # route 0x158 t=5266-5286: the model stopped for a yellow light while the SUV ahead braked, then went through it; the
-  # relevant-lead veto on every frame kept the mode in Chill until the driver braked
+  # relevant-lead veto on every frame kept the mode in Chill until the driver braked. Since D46 only a queue owns the stop
 
   def test_a_lead_going_through_a_near_stop_does_not_block_entry(self):
     assert run(ConditionalExperimentalMode(), 1.0, stop_model(), rs=through_lead())
     assert run(ConditionalExperimentalMode(), 1.0, model(should_stop=True, desired_accel=-0.3), rs=radar_state(d_one=30.0, v_one=25.0))
 
-  def test_a_lead_stopping_short_of_the_stop_blocks_entry(self):
-    assert not run(ConditionalExperimentalMode(), 2.0, stop_model(), rs=radar_state(d_one=25.0, v_one=5.0))
+  def test_a_moving_lead_that_would_rest_short_of_the_stop_does_not_block_entry(self):
+    # D42 read this lead's rest point (25 + 5^2 / 5 - 7 = 23 m) short of the 30 m stop and blocked; a moving lead is no queue
+    assert run(ConditionalExperimentalMode(), 1.0, stop_model(), rs=radar_state(d_one=25.0, v_one=5.0))
 
-  def test_the_models_likely_lead_ending_short_of_the_stop_blocks_entry(self):
+  def test_the_models_likely_lead_ending_short_of_the_stop_does_not_block_entry(self):
     md = model(path_end=30.0, terminal_speed=0.2, desired_accel=-0.3, leads=((0.8, 35.0, 0.0), (0.0, 200.0, 0.0), (0.0, 200.0, 0.0)))
-    assert not run(ConditionalExperimentalMode(), 2.0, md, rs=through_lead())
+    assert run(ConditionalExperimentalMode(), 1.0, md, rs=through_lead())
 
   def test_a_queue_past_the_stop_point_blocks_entry(self):
     # the model stops a few meters farther back from a stopped car than the MPC does, so the car's rest point lies past
@@ -383,8 +384,8 @@ class TestLeadOwnership:
 
   def test_a_tracked_lead_no_longer_owning_the_stop_ends_the_veto_at_once(self):
     cem = ConditionalExperimentalMode()
-    assert not run(cem, 1.0, stop_model(), rs=radar_state(d_one=25.0, v_one=5.0))
-    # the lead speeds up through the stop: positive evidence, so no grace runs (a lead the radar loses keeps it, see TestEntry)
+    assert not run(cem, 1.0, stop_model(), rs=radar_state(d_one=25.0, v_one=0.5))
+    # the queue moves off through the stop: positive evidence, so no grace runs (a lead the radar loses keeps it, see TestEntry)
     assert run(cem, 1.0, stop_model(), rs=through_lead())
 
   def test_a_far_stop_keeps_the_lead_veto(self):
@@ -404,9 +405,77 @@ class TestLeadOwnership:
     assert run(ConditionalExperimentalMode(), 2.0, stub, car_state(GO_ROLL_SPEED + 0.5), rs=creeping)
 
 
+YELLOW_LIGHT_SPEED = 13.5
+
+
+def yellow_light_stop(frame, should_stop=False, leads=()):
+  # route 0x1f1 t=544.9: the model's strict stop point moving between 47 and 57 m from frame to frame
+  return model(path_end=47.0 if frame % 2 else 57.0, terminal_speed=0.2, should_stop=should_stop, desired_accel=-1.3, leads=leads)
+
+
+def yellow_light_lead(v_lead=YELLOW_LIGHT_SPEED):
+  # the car ahead, 20 m out and holding 30 mph through the yellow. Its rest point by the MPC's geometry, 20 + 13.5^2 / 5 - 7 =
+  # 49.5 m, lay between the model's stop points, so D42's ownership flickered and every flicker re-armed the 3 s guard
+  return radar_state(d_one=20.0, v_one=v_lead)
+
+
+def run_frames(cem, frames, cs, rs):
+  # one model message per model frame, held for its control ticks; the control tick of entry, counted from the first frame, or None
+  for i, md in enumerate(frames):
+    for k in range(TICKS_PER_FRAME):
+      if cem.update(md, cs, rs, controls_enabled=True, model_updated=k == 0, model_valid=True):
+        return i * TICKS_PER_FRAME + k
+  return None
+
+
+class TestYellowLight:
+  # route 0x1f1 t=544.9-547.1 (2026-11-09): the model planned the stop for a yellow light the car ahead went through; the mode never
+  # entered and the driver braked with 22 m left. A moving lead no longer blocks a near stop (D46)
+
+  def entry_tick(self, rs, frames=None, cs=None):
+    cem = ConditionalExperimentalMode()
+    cs = cs if cs is not None else car_state(YELLOW_LIGHT_SPEED)
+    # a second of cruising behind the lead first, so its 3 s guard is running when the stop appears, as it was on the road
+    run(cem, 1.0, model(path_end=140.0, terminal_speed=YELLOW_LIGHT_SPEED), cs, rs)
+    assert not cem.experimental_mode
+    return run_frames(cem, frames if frames is not None else [yellow_light_stop(i) for i in range(40)], cs, rs)
+
+  def test_a_lead_going_through_a_flickering_stop_costs_no_entry_time(self):
+    no_lead = self.entry_tick(radar_state())
+    # the entry filter and the debounce: the tenth strict frame
+    assert no_lead is not None and no_lead * DT_CTRL < 0.5
+    assert self.entry_tick(yellow_light_lead()) == no_lead
+
+  def test_the_models_lead_forecast_ending_short_of_the_stop_costs_no_entry_time(self):
+    forecast = ((0.9, 25.0, 0.0), (0.0, 200.0, 0.0), (0.0, 200.0, 0.0))
+    frames = [yellow_light_stop(i, leads=forecast) for i in range(40)]
+    assert self.entry_tick(yellow_light_lead(), frames) == self.entry_tick(radar_state(), frames) is not None
+
+  def test_a_queue_still_blocks(self):
+    for v_lead in (-0.3, 0.0, 0.9):
+      assert self.entry_tick(yellow_light_lead(v_lead)) is None
+
+  def test_the_car_below_go_roll_speed_still_blocks(self):
+    # at a crawl only the model's stop bit makes a near stop; a lead pulling away still keeps the creep and launch with the lead logic
+    frames, crawl = [yellow_light_stop(i, should_stop=True) for i in range(40)], car_state(GO_ROLL_SPEED - 0.5)
+    assert self.entry_tick(yellow_light_lead(2.0), frames, crawl) is None
+    assert self.entry_tick(radar_state(), frames, crawl) is not None
+
+  def test_early_and_hint_tiers_behind_the_lead_still_block(self):
+    cs = car_state(15.0)
+    for md in (early_model(), hint_model()):
+      assert self.entry_tick(yellow_light_lead(), [md] * 40, cs) is None
+      assert self.entry_tick(radar_state(), [md] * 40, cs) is not None
+
+  def test_a_lead_whose_speed_or_place_cannot_be_read_blocks(self):
+    nan = float('nan')
+    assert self.entry_tick(yellow_light_lead(nan)) is None
+    assert self.entry_tick(radar_state(d_one=20.0, v_one=YELLOW_LIGHT_SPEED, d_two=nan, v_two=YELLOW_LIGHT_SPEED)) is None
+
+
 class TestFootprint:
   def test_the_mode_does_not_load_the_long_mpc(self):
-    # selfdrived runs the mode: it reads the MPC's stopping geometry without loading casadi or the generated solver
+    # selfdrived runs the mode: it must not load casadi or the generated solver
     heavy = ('casadi', 'openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc')
     code = f"import sys; import openpilot.selfdrive.controls.lib.conditional_experimental_mode; print([m for m in {heavy} if m in sys.modules])"
     assert subprocess.check_output([sys.executable, '-c', code], text=True).strip() == '[]'

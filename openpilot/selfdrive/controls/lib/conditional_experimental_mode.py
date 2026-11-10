@@ -86,8 +86,8 @@ class ConditionalExperimentalMode:
     obs = obs if radar_valid else StopObservation()
 
     # a relevant lead vetoes a new handoff and starts a grace; on a near stop (strict, direct) at speed, a tracked lead that does
-    # not own it ends the veto at once. During the grace one strict frame may mint a revocable release if both raw leads are
-    # gone and every model lead hypothesis is outside the stop corridor
+    # not own it (since D46 any lead but a queue or an unreadable one) ends the veto at once. During the grace one strict frame may
+    # mint a revocable release if both raw leads are gone and every model lead hypothesis is outside the stop corridor
     near_stop = obs.should_stop or obs.strict_stop
     if obs.relevant_lead and (obs.lead_owns_stop or not near_stop or car_state.vEgo < GO_ROLL_SPEED):
       self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
