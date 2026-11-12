@@ -42,6 +42,15 @@ LEAD_STOP_PATH_HALF_WIDTH = 1.5
 LEAD_CRAWL_SPEED = 1.0     # m/s, a relevant lead slower than this is stopped or creeping: a queue, which owns the stop
 MODEL_INVALID_RELEASE_S = 0.5
 
+# below the early tiers' speed, with nobody ahead, a plan that rolls on slowly to a short end (route 0x1f8 t=536.5-540.2: the lead
+# changed lanes toward a red light with the car at 13 mph, the plan then ended 37-42 m out at 2.7-4.0 m/s with the model asking 0 to
+# +0.17, no tier read it and Chill's cruise accelerated). Not a tier: CEM alone reads it (D50). SLOW_PLAN_MAX_DISTANCE = 0.0 switches
+# the reading off
+SLOW_PLAN_MAX_DISTANCE = 60.0      # m, the plan ends within this
+SLOW_PLAN_MAX_END_SPEED = 4.5      # m/s, at or below this, and no faster than the car is going now
+SLOW_PLAN_MAX_DESIRED_ACCEL = 0.3  # m/s^2, the model asking no more than this
+SLOW_PLAN_MIN_SPEED = 1.0          # m/s, the car rolling above this: at a crawl the strict tier and the stop bit decide, as before
+
 COMMITTED_TURN_MAX_SPEED = 8.0
 COMMITTED_TURN_MIN_STEERING_DEG = 35.0
 COMMITTED_TURN_MIN_CURVATURE = 0.04
@@ -66,6 +75,8 @@ class StopObservation:
   slowing: bool = False         # the plan's low point sheds most of the car's speed, wherever the plan ends
   lead_owns_stop: bool = False  # a relevant lead is a queue, or a lead cannot be read (lead_owns_stop below)
   slowing_approach: bool = False  # below STOP_EARLY_MIN_SPEED: slowing, straight, toward a point ahead, the model braking (D47; CEM entry only)
+  slow_plan: bool = False         # below STOP_EARLY_MIN_SPEED: straight, a short plan rolling on no faster than the car, the model not
+                                  # asking to speed up (D50; CEM alone reads it)
 
 
 def _finite(values):
@@ -162,6 +173,10 @@ def observe_model_stop(model, car_state, radar_state):
   # past its low point (route 0x1ef t=209.3-213.9: no tier read a red light). Not a tier: CEM alone reads it, as entry evidence (D47)
   slowing_approach = (v_ego < STOP_EARLY_MIN_SPEED and slowing and straight and path_end > 0.0
                       and desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX)
+  # the plan's reading alone, as slowing_approach: the lead condition is CEM's. A request that cannot be read is no reading
+  slow_plan = (SLOW_PLAN_MIN_SPEED < v_ego < STOP_EARLY_MIN_SPEED and straight and 0.0 < path_end <= SLOW_PLAN_MAX_DISTANCE
+               and terminal_speed <= min(v_ego, SLOW_PLAN_MAX_END_SPEED) and math.isfinite(action.desiredAcceleration)
+               and action.desiredAcceleration <= SLOW_PLAN_MAX_DESIRED_ACCEL)
 
   if action.shouldStop:
     confidence = STOP_DIRECT_CONFIDENCE
@@ -182,7 +197,7 @@ def observe_model_stop(model, car_state, radar_state):
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
                          relevant, lead_present(radar_state), committed_turn, stop_release_open(model),
                          path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing,
-                         relevant and lead_owns_stop(radar_state, v_ego, path_end), slowing_approach)
+                         relevant and lead_owns_stop(radar_state, v_ego, path_end), slowing_approach, slow_plan)
 
 
 def lane_changing(model):

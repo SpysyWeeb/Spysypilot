@@ -141,17 +141,22 @@ class ConditionalExperimentalMode:
       self._lead_release_active = True
     entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or obs.committed_turn
 
+    # below the early tiers' speed, with no relevant radar lead (the observation's own reading, D49 aside), a short plan rolling on no
+    # faster than the car and at 4.5 m/s or less, the model not asking to speed up (D50)
+    slow_plan = obs.slow_plan and not obs.relevant_lead
     evidence = obs.confidence
-    if not self.experimental_mode and obs.slowing_approach:
-      # below the early tiers' speed, a slowing, straight plan with the model braking enters at the hint's confidence (D47). It is no
-      # near stop, so a relevant lead vetoes it (one moving past the model's stop excepted, D49), and it is entry evidence only: below
-      # the hold's 0.8 it could not refresh the hold of an active mode either, and every frame carrying it is slowing, which holds the
-      # mode below
+    if not self.experimental_mode and (obs.slowing_approach or slow_plan):
+      # below the early tiers' speed, a slowing, straight plan with the model braking enters at the hint's confidence (D47), and so
+      # does a slow, short plan with nobody ahead (D50). Neither is a near stop, so a relevant lead vetoes them (one moving past the
+      # model's stop excepted, D49). Entry evidence only: below the hold's 0.8 neither could refresh the hold of an active mode; what
+      # holds a mode they entered is below
       evidence = max(evidence, STOP_EARLY_HINT_ENTRY_CONFIDENCE)
     confidence = evidence if self.experimental_mode or not entry_veto else 0.0
-    if self.experimental_mode and obs.slowing:
-      # a plan still shedding most of the speed has not reached the stop, even when it relaunches before its end:
-      # trajectory evidence, so neither the hold nor the clear hysteresis runs out and the open-road count cannot start
+    if self.experimental_mode and (obs.slowing or slow_plan):
+      # a plan still shedding most of the speed has not reached the stop, even when it relaunches before its end, and a plan still
+      # rolling slowly to a short end with nobody ahead has not left it (D50: its end reads as open road at 3 m/s and more, and the
+      # open-road count would cancel the hold a second after entry and flicker the mode off and on): trajectory evidence, so neither
+      # the hold nor the clear hysteresis runs out and the open-road count cannot start
       confidence = max(confidence, STOP_TRAJECTORY_CONFIDENCE)
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
     if raw_stop and (not self.experimental_mode or confidence >= STOP_HOLD_MIN_CONFIDENCE):

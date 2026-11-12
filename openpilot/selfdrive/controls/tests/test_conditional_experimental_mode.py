@@ -645,7 +645,14 @@ class TestLowSpeedApproach:
     # the hint tier's own 0.70 through the filter and the debounce, from a mode with no evidence yet
     return run_frames(ConditionalExperimentalMode(), [hint_model()] * 40, car_state(15.0), radar_state())
 
-  def test_a_creeping_red_light_enters_like_the_hint_tier_once_the_model_brakes(self):
+  def without_d50(self, monkeypatch):
+    # this plan ends within 60 m at 1.1-2.5 m/s, which D50's slow-plan reading also reads; these tests pin D47's reading alone
+    monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
+
+  def test_a_creeping_red_light_enters_like_the_hint_tier_once_the_model_brakes(self, monkeypatch):
+    # since D50 the same plan enters from its first frame, before the model brakes: nobody is ahead and it ends slowly within 60 m
+    assert self.entry_tick(self.red_light()) == self.hint_entry_tick()
+    self.without_d50(monkeypatch)
     first = next(i for i in range(60) if red_light_request(i) <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX)
     tick = self.entry_tick(self.red_light())
     assert tick is not None and tick - first * TICKS_PER_FRAME == self.hint_entry_tick()
@@ -661,7 +668,11 @@ class TestLowSpeedApproach:
     assert self.entry_tick(frames[:needed - 1] + [model()] * 40) is None
     assert self.entry_tick(frames[:needed] + [model()] * 40) is not None
 
-  def test_no_entry_while_the_model_asks_for_less_braking_than_the_hint_tier(self):
+  def test_no_entry_while_the_model_asks_for_less_braking_than_the_hint_tier(self, monkeypatch):
+    # since D50 a request up to +0.3 enters on this plan, which ends within 60 m below the car's speed; a request it cannot read does not
+    for request, d50 in ((STOP_EARLY_HINT_DESIRED_ACCEL_MAX + 0.01, True), (0.0, True), (float('nan'), False)):
+      assert (self.entry_tick([creeping_stop(i, desired_accel=request) for i in range(40)]) is not None) == d50
+    self.without_d50(monkeypatch)
     for request in (STOP_EARLY_HINT_DESIRED_ACCEL_MAX + 0.01, 0.0, float('nan')):
       assert self.entry_tick([creeping_stop(i, desired_accel=request) for i in range(40)]) is None
 
@@ -672,10 +683,14 @@ class TestLowSpeedApproach:
     assert self.entry_tick([creeping_stop(i, curvature=1.1 / LOW_SPEED_APPROACH ** 2) for i in range(40)]) is None
     assert self.entry_tick([creeping_stop(i, heading=math.radians(25.0)) for i in range(40)]) is None
 
-  def test_no_entry_when_the_plan_does_not_slow_or_ends_behind_the_car(self):
-    # the low point must sit at or below 35 % of the car's speed; a plan that keeps 4 m/s of 10 is a slowdown, not a stop
-    assert self.entry_tick([creeping_stop(i, low=4.0, end=4.5) for i in range(40)]) is None
+  def test_no_entry_when_the_plan_does_not_slow_or_ends_behind_the_car(self, monkeypatch):
+    # the low point must sit at or below 35 % of the car's speed; a plan that keeps 4 m/s of 10 is a slowdown, not a stop (D47). Ending
+    # at 4.5 m/s within 60 m it is a slow plan, which enters since D50; ending at 5 m/s it is neither
+    assert self.entry_tick([creeping_stop(i, low=4.0, end=4.5) for i in range(40)]) is not None
+    assert self.entry_tick([creeping_stop(i, low=4.0, end=5.0) for i in range(40)]) is None
     assert self.entry_tick([creeping_stop(i, path_end=-1.0) for i in range(40)]) is None
+    self.without_d50(monkeypatch)
+    assert self.entry_tick([creeping_stop(i, low=4.0, end=4.5) for i in range(40)]) is None
 
   def test_at_or_above_the_early_tiers_speed_the_existing_tiers_alone_decide(self):
     # the same creeping plan ending beyond the early and hint windows: no tier reads it there, so no entry
@@ -710,6 +725,133 @@ class TestLowSpeedApproach:
     assert run(cem, STOP_INTENT_HOLD_S + 1.5, creeping_stop(desired_accel=-0.1), cs)
     # no longer slowing and no other evidence: the hold runs out and the clear hysteresis ends the mode
     assert not run(cem, STOP_INTENT_HOLD_S + 1.5, murky_model(), cs)
+
+
+SLOW_PLAN_SPEED = 5.3
+
+
+def slow_plan(v_ego=SLOW_PLAN_SPEED, end=3.5, path_end=40.0, desired_accel=0.1, curvature=0.0, heading=0.0):
+  # route 0x1f8 t=536.5-540.2: the lead gone, the plan rolling on from 5.3 m/s to 2.7-4.0 m/s at 37-42 m, the model asking 0 to +0.17;
+  # no tier reads it, and it sheds too little of the speed and does not brake for D47
+  md = model(path_end=path_end, terminal_speed=end, desired_accel=desired_accel)
+  md.velocity.x = [v_ego + (end - v_ego) * i / (N - 1) for i in range(N)]
+  md.action.desiredCurvature = curvature
+  md.orientation.z = [heading * i / (N - 1) for i in range(N)]
+  return md
+
+
+class TestSlowPlan:
+  # route 0x1f8 t=532-540.2 (2026-11-11): approaching a red light at 13 mph behind a lead that changed lanes at t=536.5. From then the
+  # model's plan rolled on slowly to a short end, no tier read it, Chill's cruise accelerated at up to +1.0 m/s^2 and the driver braked
+  # at t=540.2. Below 13 m/s, with nobody ahead, such a plan is entry evidence at the hint tier's 0.70 and holds a mode it entered (D50)
+
+  def entry_tick(self, frames, cs=None, rs=None):
+    return run_frames(ConditionalExperimentalMode(), frames, cs if cs is not None else car_state(SLOW_PLAN_SPEED),
+                      rs if rs is not None else radar_state())
+
+  def hint_entry_tick(self):
+    return run_frames(ConditionalExperimentalMode(), [hint_model()] * 40, car_state(15.0), radar_state())
+
+  def test_a_slow_short_plan_with_nobody_ahead_enters_like_the_hint_tier(self):
+    assert self.entry_tick([slow_plan()] * 40) == self.hint_entry_tick() is not None
+    for v_ego, end, path_end in ((2.0, 1.5, 15.0), (8.0, 4.5, 55.0), (STOP_EARLY_MIN_SPEED - 0.1, 4.0, 60.0)):
+      assert self.entry_tick([slow_plan(v_ego, end, path_end)] * 40, car_state(v_ego)) is not None
+
+  def test_the_rule_switched_off_does_not_enter(self, monkeypatch):
+    monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
+    assert self.entry_tick([slow_plan()] * 40) is None
+
+  def test_no_entry_off_a_straight_approach(self):
+    assert self.entry_tick([slow_plan()] * 40, car_state(SLOW_PLAN_SPEED, blinker=True)) is None
+    assert self.entry_tick([slow_plan(curvature=1.1 / SLOW_PLAN_SPEED ** 2)] * 40) is None
+    assert self.entry_tick([slow_plan(heading=math.radians(25.0))] * 40) is None
+
+  def test_no_entry_behind_a_relevant_lead(self):
+    for rs in (radar_state(d_one=25.0, v_one=5.0), radar_state(d_one=20.0, v_one=0.0), radar_state(d_two=45.0, v_two=4.0)):
+      assert self.entry_tick([slow_plan()] * 40, rs=rs) is None
+    # a lead outside the relevance window is nobody ahead
+    assert self.entry_tick([slow_plan()] * 40, rs=radar_state(d_one=120.0, v_one=8.0)) is not None
+
+  def test_no_entry_at_or_above_the_early_tiers_speed(self):
+    for v_ego in (STOP_EARLY_MIN_SPEED, 14.0):
+      assert self.entry_tick([slow_plan(v_ego, 4.0, 55.0)] * 40, car_state(v_ego)) is None
+
+  def test_no_entry_on_a_plan_that_speeds_up_runs_long_or_ends_fast(self):
+    assert self.entry_tick([slow_plan(3.0, 3.5, 30.0)] * 40, car_state(3.0)) is None
+    assert self.entry_tick([slow_plan(8.0, 4.6, 55.0)] * 40, car_state(8.0)) is None
+    assert self.entry_tick([slow_plan(path_end=61.0)] * 40) is None
+    for request in (0.31, 0.6, float('nan')):
+      assert self.entry_tick([slow_plan(desired_accel=request)] * 40) is None
+    # at a crawl the strict tier and the stop bit decide
+    assert self.entry_tick([slow_plan(0.9, 0.8, 8.0)] * 40, car_state(0.9)) is None
+
+  def test_a_steady_slow_approach_stays_on_without_flicker(self):
+    cem, cs = ConditionalExperimentalMode(), car_state(SLOW_PLAN_SPEED)
+    assert run_frames(cem, [slow_plan()] * 40, cs, radar_state()) is not None
+    for tick in range(round(10.0 / DT_CTRL)):
+      assert cem.update(slow_plan(), cs, radar_state(), controls_enabled=True, model_updated=tick % TICKS_PER_FRAME == 0, model_valid=True)
+
+  def test_the_mode_ends_when_the_plan_launches(self):
+    cem, cs = ConditionalExperimentalMode(), car_state(SLOW_PLAN_SPEED)
+    assert run_frames(cem, [slow_plan()] * 40, cs, radar_state()) is not None
+    assert run(cem, 3.0, slow_plan(), cs)
+    # the model asks for real acceleration on an open road: the go exit
+    assert run(cem, GO_CONFIRM_S - 0.1, launch_model(SLOW_PLAN_SPEED, 12.0, 80.0, GO_ACCEL + 0.3), cs)
+    assert not run(cem, 0.15, launch_model(SLOW_PLAN_SPEED, 12.0, 80.0, GO_ACCEL + 0.3), cs)
+
+  def test_the_mode_ends_when_the_plan_stops_being_a_slow_plan(self):
+    # a blinker, or a lead pulling in: the same plan no longer holds, its end reads as open road, the open-road count cancels the hold
+    # and the clear hysteresis ends the mode; that is also what would end it a second after entry without the hold
+    cs = car_state(SLOW_PLAN_SPEED)
+    for cs_after, rs_after in ((car_state(SLOW_PLAN_SPEED, blinker=True), radar_state()), (cs, radar_state(d_one=20.0, v_one=5.0))):
+      cem = ConditionalExperimentalMode()
+      assert run_frames(cem, [slow_plan()] * 40, cs, radar_state()) is not None
+      assert run(cem, 3.0, slow_plan(), cs)
+      assert run(cem, CLEAR_CANCEL_S, slow_plan(), cs_after, rs_after)
+      assert not run(cem, STOP_RELEASE_HYSTERESIS_S + 0.5, slow_plan(), cs_after, rs_after)
+
+
+def scripted_drive():
+  # model frames, each with its car and radar state, through the three D48-D50 events, an exit after each, and pedals
+  lost, junction = car_state(LOST_LEAD_SPEED), car_state(JUNCTION_SPEED)
+  frames = [(model(path_end=150.0, terminal_speed=LOST_LEAD_SPEED), lost, radar_state(d_one=40.0, v_one=LOST_LEAD_SPEED))] * 20
+  frames += [(early_model(LOST_LEAD_SPEED), lost, radar_state())] * 90
+  frames += [(model(path_end=150.0, terminal_speed=LOST_LEAD_SPEED), lost, radar_state())] * 120
+  frames += [(model(path_end=140.0, terminal_speed=JUNCTION_SPEED), junction, through_the_junction())] * 20
+  frames += [(md, junction, through_the_junction()) for md in junction_frames(90)]
+  frames += [(launch_model(JUNCTION_SPEED, 20.0, 150.0, GO_ACCEL + 0.3), junction, through_the_junction())] * 60
+  frames += [(slow_plan(), car_state(SLOW_PLAN_SPEED), radar_state())] * 100
+  frames += [(slow_plan(), car_state(SLOW_PLAN_SPEED, brake=True), radar_state())] * 2
+  frames += [(slow_plan(), car_state(SLOW_PLAN_SPEED), radar_state())] * 100
+  frames += [(murky_model(), car_state(SLOW_PLAN_SPEED), radar_state())] * 160
+  return frames
+
+
+def mode_changes(cem, frames):
+  # the control ticks at which the mode switches, over the drive at the real cadence
+  out, prev = [], False
+  for i, (md, cs, rs) in enumerate(frames):
+    for k in range(TICKS_PER_FRAME):
+      mode = cem.update(md, cs, rs, controls_enabled=True, model_updated=k == 0, model_valid=True)
+      if mode != prev:
+        out.append(i * TICKS_PER_FRAME + k)
+      prev = mode
+  return out
+
+
+# what the class of 1190ad8 (before D48-D50) does on scripted_drive(), recorded from that commit's own two files: it enters on the early
+# tier only after the 3 s guard and nowhere else. With the rules on it switches at [200, 655, 1350, 1745, 2110, 2500, 2770, 3406]
+DRIVE_BEFORE_D48 = [450, 655]
+
+
+class TestRulesOff:
+  def test_with_the_three_rules_off_the_mode_is_the_one_before_them(self, monkeypatch):
+    on = mode_changes(ConditionalExperimentalMode(), scripted_drive())
+    monkeypatch.setattr(cem_module, 'LEAD_RELEASE_HYSTERESIS_S', 3.0)
+    monkeypatch.setattr(cem_module, 'LEAD_BEYOND_STOP_MEMORY_S', 0.0)
+    monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
+    assert mode_changes(ConditionalExperimentalMode(), scripted_drive()) == DRIVE_BEFORE_D48
+    assert on != DRIVE_BEFORE_D48
 
 
 class TestFootprint:

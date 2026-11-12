@@ -6,8 +6,9 @@ import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.stop_helpers import (LEAD_CRAWL_SPEED, STOP_DIRECT_CONFIDENCE, STOP_EARLY_CONFIDENCE,
                                                            STOP_EARLY_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_CONFIDENCE,
                                                            STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
-                                                           STOP_EARLY_MIN_SPEED, STOP_TRAJECTORY_CONFIDENCE, lead_owns_stop,
-                                                           leads_clear_of_stop_path, observe_model_stop, stop_release_open)
+                                                           STOP_EARLY_MIN_SPEED, STOP_TRAJECTORY_CONFIDENCE, SLOW_PLAN_MAX_DESIRED_ACCEL,
+                                                           SLOW_PLAN_MAX_DISTANCE, SLOW_PLAN_MAX_END_SPEED, SLOW_PLAN_MIN_SPEED,
+                                                           lead_owns_stop, leads_clear_of_stop_path, observe_model_stop, stop_release_open)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
@@ -280,3 +281,50 @@ class TestSlowingApproach:
     assert obs.slowing_approach and obs.relevant_lead
     obs = observe(creeping(end=0.5, path_end=30.0), car_state(10.0))
     assert obs.slowing_approach and obs.strict_stop and obs.confidence == STOP_TRAJECTORY_CONFIDENCE
+
+
+def rolling(v_ego=5.3, end=3.5, path_end=40.0, desired_accel=0.1, **kwargs):
+  # route 0x1f8 t=536.5-540.2: the lead gone, the plan rolling on from 5.3 m/s to 2.7-4.0 m/s at 37-42 m, the model asking 0 to +0.17
+  md = model(path_end=path_end, terminal_speed=end, desired_accel=desired_accel, **kwargs)
+  md.velocity.x = [v_ego + (end - v_ego) * i / (N - 1) for i in range(N)]
+  return md
+
+
+class TestSlowPlan:
+  # D50: below STOP_EARLY_MIN_SPEED and above SLOW_PLAN_MIN_SPEED, a straight plan ending within SLOW_PLAN_MAX_DISTANCE no faster than
+  # the car and at SLOW_PLAN_MAX_END_SPEED or less, the model asking at most SLOW_PLAN_MAX_DESIRED_ACCEL. The plan's reading alone: the
+  # lead condition and what it means are CEM's, and no tier, confidence or other field moves
+  def test_the_lead_left_red_light_reads_as_a_slow_plan_and_nothing_else(self):
+    for end, path_end, desired_accel in ((2.7, 37.0, 0.0), (4.0, 42.0, 0.17), (3.5, 40.0, -0.1)):
+      obs = observe(rolling(end=end, path_end=path_end, desired_accel=desired_accel), car_state(5.3))
+      assert obs.slow_plan
+      assert obs.confidence == 0.0 and not (obs.should_stop or obs.strict_stop or obs.early_stop or obs.slowing or obs.slowing_approach)
+    # at its limits
+    assert observe(rolling(v_ego=SLOW_PLAN_MIN_SPEED + 0.1, end=SLOW_PLAN_MIN_SPEED + 0.1, path_end=8.0), car_state(SLOW_PLAN_MIN_SPEED + 0.1)).slow_plan
+    # (the message holds float32: 0.3 itself reads as 0.30000001)
+    assert observe(rolling(v_ego=12.9, end=SLOW_PLAN_MAX_END_SPEED, path_end=SLOW_PLAN_MAX_DISTANCE,
+                           desired_accel=SLOW_PLAN_MAX_DESIRED_ACCEL - 1e-6), car_state(12.9)).slow_plan
+
+  def test_each_condition_is_needed(self):
+    cs = car_state(5.3)
+    assert not observe(rolling(end=5.4), cs).slow_plan
+    assert not observe(rolling(v_ego=8.0, end=SLOW_PLAN_MAX_END_SPEED + 0.1), car_state(8.0)).slow_plan
+    assert not observe(rolling(path_end=SLOW_PLAN_MAX_DISTANCE + 0.5), cs).slow_plan
+    assert not observe(rolling(path_end=0.0), cs).slow_plan
+    assert not observe(rolling(desired_accel=SLOW_PLAN_MAX_DESIRED_ACCEL + 0.01), cs).slow_plan
+    assert not observe(rolling(desired_accel=float('nan')), cs).slow_plan
+    assert not observe(rolling(), car_state(5.3, blinker=True)).slow_plan
+    assert not observe(rolling(curvature=1.1 / 5.3 ** 2), cs).slow_plan
+    assert not observe(rolling(heading=math.radians(25.0)), cs).slow_plan
+    for v_ego in (STOP_EARLY_MIN_SPEED, 14.0):
+      assert not observe(rolling(v_ego=v_ego, end=4.0), car_state(v_ego)).slow_plan
+    assert not observe(rolling(v_ego=SLOW_PLAN_MIN_SPEED, end=0.8, path_end=8.0), car_state(SLOW_PLAN_MIN_SPEED)).slow_plan
+    assert not observe(messaging.new_message('modelV2').modelV2).slow_plan
+
+  def test_it_is_read_whatever_the_leads(self):
+    obs = observe(rolling(), car_state(5.3), radar_state(d_one=25.0, v_one=5.0))
+    assert obs.slow_plan and obs.relevant_lead
+
+  def test_switched_off_at_zero_distance(self, monkeypatch):
+    monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
+    assert not observe(rolling(), car_state(5.3)).slow_plan
