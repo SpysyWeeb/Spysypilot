@@ -18,10 +18,24 @@ from openpilot.selfdrive.selfdrived.alertmanager import OFFROAD_ALERTS
 
 BACKLIGHT_OFFROAD = 65 if HARDWARE.get_device_type() == "mici" else 50
 PARAM_UPDATE_TIME = 1 / 5.0
-ONROAD_DIM_BRIGHTNESS = 5  # percent; engaged onroad screen fades to this when nothing needs attention
-ONROAD_DIM_FADE_TIME = 5.0  # seconds to fade from ambient brightness down to the dim level
-ONROAD_DIM_WAKE_TIME = 1.0  # seconds to restore ambient brightness on any wake condition
-ONROAD_DIM_HOLD_TIME = 10.0  # seconds of continuous quiet before the fade starts (comma 3X onroad touch window length)
+ONROAD_DIM_BRIGHTNESS = 5  # percent; onroad automatic brightness in the dark
+ONROAD_DIM_KNEE = 0.1  # light reading (after the CIE curve) below which the onroad brightness runs on down to the dim level
+ONROAD_ALERT_BRIGHTNESS = 30  # percent; least onroad brightness while an alert is on screen (upstream's automatic floor)
+ONROAD_ALERT_RELEASE_TIME = 1.0  # seconds to ease back to the automatic brightness once the alert has cleared
+
+
+def onroad_brightness(light_sensor: float) -> float:
+  """Automatic onroad brightness in percent for a light sensor reading of 0..100, before the ambient filter."""
+  # CIE 1931 - https://www.photonstophotos.net/GeneralTopics/Exposure/Psychometric_Lightness_and_Gamma.htm
+  if light_sensor <= 8:
+    x = light_sensor / 903.3
+  else:
+    x = ((light_sensor + 16.0) / 116.0) ** 3.0
+
+  # upstream's line from 30 to 100 percent; below a low knee it runs on down to the dim level, so the dark gets a dim screen
+  if x < ONROAD_DIM_KNEE:
+    return float(np.interp(x, [0, ONROAD_DIM_KNEE], [ONROAD_DIM_BRIGHTNESS, np.interp(ONROAD_DIM_KNEE, [0, 1], [30, 100])]))
+  return float(np.interp(x, [0, 1], [30, 100]))
 
 
 class UIStatus(Enum):
@@ -298,9 +312,7 @@ class Device:
     self._brightness_thread: threading.Thread | None = None
     self._brightness_event = threading.Event()
     self._brightness_target: int = 0
-    self._dim_fraction: float = 0.0
-    self._dim_last_ts: float = time.monotonic()
-    self._dim_hold_until: float = 0.0
+    self._alert_time: float = float('-inf')  # last frame an onroad alert was on screen
 
   @property
   def awake(self) -> bool:
@@ -356,19 +368,12 @@ class Device:
     clipped_brightness = self._offroad_brightness
 
     if ui_state.started and ui_state.light_sensor >= 0:
-      clipped_brightness = ui_state.light_sensor
+      clipped_brightness = onroad_brightness(ui_state.light_sensor)
 
-      # CIE 1931 - https://www.photonstophotos.net/GeneralTopics/Exposure/Psychometric_Lightness_and_Gamma.htm
-      if clipped_brightness <= 8:
-        clipped_brightness = clipped_brightness / 903.3
-      else:
-        clipped_brightness = ((clipped_brightness + 16.0) / 116.0) ** 3.0
-
-      clipped_brightness = float(np.interp(clipped_brightness, [0, 1], [30, 100]))
-
-    ambient = self._brightness_filter.update(clipped_brightness)
-    dim_level = min(ONROAD_DIM_BRIGHTNESS, ambient)
-    brightness = round(ambient - (ambient - dim_level) * self._update_dim_fraction())
+    brightness = self._brightness_filter.update(clipped_brightness)
+    # an alert lifts a dark screen to the old floor at once, not through the slow ambient filter
+    brightness += max(ONROAD_ALERT_BRIGHTNESS - brightness, 0.0) * self._alert_lift()
+    brightness = round(brightness)
     if not self._awake:
       brightness = 0
 
@@ -377,29 +382,19 @@ class Device:
       self._brightness_event.set()
       self._last_brightness = brightness
 
-  def _update_dim_fraction(self) -> float:
-    # Engaged-only onroad dimming: fade down while nothing needs attention, wake quickly otherwise
+  def _alert_lift(self) -> float:
+    # 1 while an onroad alert is on screen; afterwards it falls linearly to 0 over the release time
     now = time.monotonic()
-    dt = float(np.clip(now - self._dim_last_ts, 0.0, 0.25))  # a stalled frame must not jump the fade
-    self._dim_last_ts = now
     if not ui_state.started:
-      self._dim_fraction = 0.0
-      return self._dim_fraction
+      self._alert_time = float('-inf')
+      return 0.0
 
     sm = ui_state.sm
-    ss = sm['selfdriveState']
-    # stale selfdriveState mirrors AlertRenderer.get_alert's own "Waiting to start" / "System Unresponsive" alerts
+    # stale selfdriveState stands for AlertRenderer.get_alert's own "Waiting to start" / "System Unresponsive" alerts
     ss_fresh = sm.alive['selfdriveState'] and sm.valid['selfdriveState'] and sm.recv_frame['selfdriveState'] > ui_state.started_frame
-    attention = not (ui_state.status == UIStatus.ENGAGED and ss_fresh and ss.alertSize == log.SelfdriveState.AlertSize.none)
-    if attention:
-      # separate from the interactive timeout, whose reset drives layout callbacks; a touch is its own hold
-      self._dim_hold_until = now + ONROAD_DIM_HOLD_TIME
-      if ss.alertStatus == log.SelfdriveState.AlertStatus.critical or ss.alertSize == log.SelfdriveState.AlertSize.full:
-        self._dim_fraction = 0.0  # critical or full-screen alerts restore ambient at once
-    quiet = (not attention) and now > self._dim_hold_until and now > self._interaction_time
-    step = dt / ONROAD_DIM_FADE_TIME if quiet else -dt / ONROAD_DIM_WAKE_TIME
-    self._dim_fraction = float(np.clip(self._dim_fraction + step, 0.0, 1.0))
-    return self._dim_fraction
+    if not ss_fresh or sm['selfdriveState'].alertSize != log.SelfdriveState.AlertSize.none:
+      self._alert_time = now
+    return float(np.clip(1.0 - (now - self._alert_time) / ONROAD_ALERT_RELEASE_TIME, 0.0, 1.0))
 
   def _update_wakefulness(self):
     # Handle interactive timeout

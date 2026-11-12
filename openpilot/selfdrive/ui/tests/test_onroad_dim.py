@@ -1,14 +1,25 @@
+import numpy as np
 import pytest
 
 from openpilot.cereal import log
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui import ui_state as ui_state_module
-from openpilot.selfdrive.ui.ui_state import (Device, UIStatus, ONROAD_DIM_BRIGHTNESS, ONROAD_DIM_FADE_TIME, ONROAD_DIM_HOLD_TIME,
-                                             ONROAD_DIM_WAKE_TIME, ui_state)
+from openpilot.selfdrive.ui.ui_state import (BACKLIGHT_OFFROAD, Device, UIStatus, ONROAD_ALERT_BRIGHTNESS, ONROAD_ALERT_RELEASE_TIME,
+                                             ONROAD_DIM_BRIGHTNESS, ONROAD_DIM_KNEE, onroad_brightness, ui_state)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
-DT = 0.05  # 20 Hz steps, well under the 0.25 s clamp
+DT = 0.05  # 20 Hz frames, the comma 3X UI rate
 STARTED_FRAME = 10
+
+
+def cie(light_sensor):
+  return light_sensor / 903.3 if light_sensor <= 8 else ((light_sensor + 16.0) / 116.0) ** 3.0
+
+
+def old_onroad_brightness(light_sensor):
+  # the automatic onroad brightness before this change (upstream's): the CIE curve mapped linearly onto 30..100 percent
+  return float(np.interp(cie(light_sensor), [0, 1], [30, 100]))
 
 
 class Sm(dict):
@@ -36,14 +47,12 @@ def env(monkeypatch):
   monkeypatch.setattr(ui_state, 'started', True)
   monkeypatch.setattr(ui_state, 'status', UIStatus.ENGAGED)
   monkeypatch.setattr(ui_state, 'started_frame', STARTED_FRAME)
-  monkeypatch.setattr(ui_state, 'light_sensor', -1)  # ambient target is the deterministic offroad value
+  monkeypatch.setattr(ui_state, 'light_sensor', 0.0)
 
-  def make_device(ambient=50):
+  def make_device(light_sensor=0.0):
+    monkeypatch.setattr(ui_state, 'light_sensor', light_sensor)
     dev = Device()
-    dev._offroad_brightness = ambient
-    dev._brightness_filter.x = ambient
-    dev._interaction_time = clock.t - 1  # last touch long ago
-    dev._dim_hold_until = clock.t - 1  # quiet hold already expired: fade starts at once
+    dev._brightness_filter.x = onroad_brightness(light_sensor)  # the slow ambient filter has settled
     return dev
   return clock, sm, make_device
 
@@ -57,207 +66,175 @@ def step(clock, dev, n=1, dt=DT):
   return out
 
 
-def assert_holds_then_fades(clock, dev, ambient):
-  # the last attention frame was the previous step: ambient for the whole hold, then the fade starts
-  assert set(step(clock, dev, round(ONROAD_DIM_HOLD_TIME / DT) - 1)) == {ambient}
-  assert dev._dim_fraction == 0.0
-  step(clock, dev, 2)  # the hold ends on this boundary (one frame of float slack)
-  assert 0.0 < dev._dim_fraction <= 2 * DT / ONROAD_DIM_FADE_TIME
-  fade_fully(clock, dev)
+def test_owner_numbers_are_pinned():
+  # 5 percent in the dark, knee at 0.1 (37 percent), alerts at least the old 30 percent floor, 1 s back
+  assert (ONROAD_DIM_BRIGHTNESS, ONROAD_DIM_KNEE, ONROAD_ALERT_BRIGHTNESS, ONROAD_ALERT_RELEASE_TIME) == (5, 0.1, 30, 1.0)
 
 
-def fade_fully(clock, dev):
-  vals = step(clock, dev, round(ONROAD_DIM_FADE_TIME / DT))
-  assert vals[-1] == ONROAD_DIM_BRIGHTNESS
-  return vals
-
-
-@pytest.mark.parametrize('ambient', [30, 50, 100])
-def test_quiet_fades_to_dim_over_fade_time_and_holds(env, ambient):
+@pytest.mark.parametrize('status', list(UIStatus))
+def test_dark_gives_the_dim_level(env, monkeypatch, status):
   clock, _, make_device = env
-  dev = make_device(ambient)
-  vals = step(clock, dev, round(ONROAD_DIM_FADE_TIME / DT))
-  assert all(a >= b for a, b in zip(vals, vals[1:], strict=False))
-  assert vals[0] >= ambient - 1  # starts at ambient, no jump
-  half = len(vals) // 2 - 1  # 2.5 s into the fade: linear blend is halfway
-  assert abs(vals[half] - (ambient + ONROAD_DIM_BRIGHTNESS) / 2) <= 1
-  assert vals[-1] == ONROAD_DIM_BRIGHTNESS
-  assert dev._brightness_target == ONROAD_DIM_BRIGHTNESS
+  monkeypatch.setattr(ui_state, 'status', status)
+  assert onroad_brightness(0.0) == ONROAD_DIM_BRIGHTNESS
+  dev = make_device(0.0)
   assert set(step(clock, dev, 200)) == {ONROAD_DIM_BRIGHTNESS}
+  assert dev._brightness_target == ONROAD_DIM_BRIGHTNESS
 
 
-def test_owner_numbers_are_pinned(env):
-  # owner decisions are fixed: 5 percent, 5 s fade, 1 s wake, 10 s hold; literals here so a constant change fails
-  assert (ONROAD_DIM_BRIGHTNESS, ONROAD_DIM_FADE_TIME, ONROAD_DIM_WAKE_TIME, ONROAD_DIM_HOLD_TIME) == (5, 5.0, 1.0, 10.0)
+def test_mapping_is_the_old_line_at_and_above_the_knee():
+  readings = np.linspace(0.0, 100.0, 20001)
+  above = [L for L in readings if cie(L) >= ONROAD_DIM_KNEE]
+  assert len(above) > 10000
+  for L in above:
+    assert onroad_brightness(L) == old_onroad_brightness(L), L
+  assert onroad_brightness(100.0) == old_onroad_brightness(100.0) == 100
+
+
+def test_below_the_knee_it_runs_from_the_knee_value_down_to_the_dim_level():
+  knee_value = float(np.interp(ONROAD_DIM_KNEE, [0, 1], [30, 100]))
+  assert knee_value == pytest.approx(37)
+  below = [L for L in np.linspace(0.0, 40.0, 4001) if cie(L) < ONROAD_DIM_KNEE]
+  assert len(below) > 3000
+  for L in below:
+    x = cie(L)
+    assert onroad_brightness(L) == pytest.approx(ONROAD_DIM_BRIGHTNESS + (knee_value - ONROAD_DIM_BRIGHTNESS) * x / ONROAD_DIM_KNEE)
+    assert ONROAD_DIM_BRIGHTNESS <= onroad_brightness(L) <= old_onroad_brightness(L)
+  # continuous at the knee and never decreasing with more light
+  values = [onroad_brightness(L) for L in np.linspace(0.0, 100.0, 20001)]
+  assert all(a <= b for a, b in zip(values, values[1:], strict=False))
+  assert onroad_brightness(below[-1]) == pytest.approx(knee_value, abs=0.05)
+
+
+@pytest.mark.parametrize('status', list(UIStatus))
+def test_above_the_knee_the_screen_is_frame_for_frame_the_old_automatic_brightness(env, monkeypatch, status):
+  # the old code dimmed only while engaged; disengaged it showed exactly round(filter(old line)). Alerts on a bright screen change nothing.
   clock, sm, make_device = env
-  dev = make_device(100)
-  assert abs(step(clock, dev, round(4.0 / DT))[-1] - 24) <= 1  # 4 s in: 100 - 95 * 0.8, not yet dim
-  assert step(clock, dev, round(1.0 / DT))[-1] == 5  # 5 s in: fully dim
-  sm['selfdriveState'].alertSize = AlertSize.small
-  assert abs(step(clock, dev, round(0.5 / DT))[-1] - 52.5) <= 1  # 0.5 s into the wake: halfway, not already 100
-  assert step(clock, dev, round(0.5 / DT))[-1] == 100  # 1 s: fully awake
+  monkeypatch.setattr(ui_state, 'status', status)
+  readings = 69.0 + 31.0 * np.sin(np.linspace(0.0, 12.0, 600))  # 38..100, all at or above the knee
+  assert min(cie(L) for L in readings) >= ONROAD_DIM_KNEE
+  dev = make_device(readings[0])
+  ref = FirstOrderFilter(dev._brightness_filter.x, 10.0, dev._brightness_filter.dt)
+  for i, L in enumerate(readings):
+    monkeypatch.setattr(ui_state, 'light_sensor', float(L))
+    sm['selfdriveState'].alertSize = AlertSize.mid if (i // 50) % 2 else AlertSize.none
+    assert step(clock, dev)[-1] == round(ref.update(old_onroad_brightness(L)))
 
 
-def test_already_dim_ambient_never_brightens(env):
-  clock, _, make_device = env
-  dev = make_device(3)
-  assert set(step(clock, dev, 200)) == {3}
+def run_drive(clock, sm, dev, monkeypatch):
+  # dark, an alert, its release, a stale selfdriveState, then daylight
+  out = []
+  for light, size, alive, n in [(0.0, AlertSize.none, True, 100), (0.0, AlertSize.small, True, 30), (0.0, AlertSize.none, True, 40),
+                                (0.0, AlertSize.none, False, 10), (14.5, AlertSize.none, True, 100), (99.5, AlertSize.none, True, 300)]:
+    monkeypatch.setattr(ui_state, 'light_sensor', light)
+    sm['selfdriveState'].alertSize = size
+    sm.alive['selfdriveState'] = alive
+    out += step(clock, dev, n)
+  return out
+
+
+def test_engaged_or_not_makes_no_difference(env, monkeypatch):
+  clock, sm, make_device = env
+  runs = {}
+  for status in UIStatus:
+    monkeypatch.setattr(ui_state, 'status', status)
+    clock.t = 1000.0
+    runs[status] = run_drive(clock, sm, make_device(0.0), monkeypatch)
+  assert all(r == runs[UIStatus.ENGAGED] for r in runs.values())
+  assert min(runs[UIStatus.ENGAGED]) == ONROAD_DIM_BRIGHTNESS
 
 
 @pytest.mark.parametrize('size', [AlertSize.small, AlertSize.mid, AlertSize.full])
-def test_any_alert_restores_within_wake_time(env, size):
+@pytest.mark.parametrize('status', [AlertStatus.normal, AlertStatus.userPrompt, AlertStatus.critical])
+def test_any_alert_lifts_a_dark_screen_on_its_first_frame(env, size, status):
   clock, sm, make_device = env
-  dev = make_device(30)
-  fade_fully(clock, dev)
+  dev = make_device(0.0)
+  assert step(clock, dev, 20)[-1] == ONROAD_DIM_BRIGHTNESS
   sm['selfdriveState'].alertSize = size
-  vals = step(clock, dev, round(ONROAD_DIM_WAKE_TIME / DT))
-  assert all(a <= b for a, b in zip(vals, vals[1:], strict=False))
-  assert vals[-1] == 30
-  assert dev._brightness_target == 30
-  assert set(step(clock, dev, 200)) == {30}
-
-
-@pytest.mark.parametrize('status', [UIStatus.OVERRIDE, UIStatus.DISENGAGED, UIStatus.AOL_ACTIVE])
-def test_non_engaged_status_never_dims_and_wakes(env, monkeypatch, status):
-  clock, _, make_device = env
-  monkeypatch.setattr(ui_state, 'status', status)
-  dev = make_device()
-  assert set(step(clock, dev, 200)) == {50}
-
-  monkeypatch.setattr(ui_state, 'status', UIStatus.ENGAGED)
-  assert_holds_then_fades(clock, dev, 50)
-  monkeypatch.setattr(ui_state, 'status', status)
-  assert step(clock, dev, round(ONROAD_DIM_WAKE_TIME / DT))[-1] == 50
+  sm['selfdriveState'].alertStatus = status
+  assert step(clock, dev) == [ONROAD_ALERT_BRIGHTNESS]
+  assert dev._brightness_target == ONROAD_ALERT_BRIGHTNESS
+  assert set(step(clock, dev, round(10.0 / DT))) == {ONROAD_ALERT_BRIGHTNESS}  # held for as long as the alert is up
 
 
 @pytest.mark.parametrize('stale', ['alive', 'valid', 'recv_frame_equal', 'recv_frame_old'])
-def test_stale_selfdrive_state_never_dims_and_wakes(env, stale):
+def test_stale_selfdrive_state_lifts_a_dark_screen_on_its_first_frame(env, stale):
+  # the UI's own "Waiting to start" / "System Unresponsive" (TAKE CONTROL IMMEDIATELY) alerts come from a stale selfdriveState
   clock, sm, make_device = env
-
-  def make_stale():
-    if stale in ('alive', 'valid'):
-      getattr(sm, stale)['selfdriveState'] = False
-    else:
-      sm.recv_frame['selfdriveState'] = STARTED_FRAME if stale == 'recv_frame_equal' else STARTED_FRAME - 5
-
-  dev = make_device()
-  fade_fully(clock, dev)
-  make_stale()
-  assert step(clock, dev, round(ONROAD_DIM_WAKE_TIME / DT))[-1] == 50
-  assert set(step(clock, dev, 200)) == {50}
-
-
-def test_touch_wakes_and_holds_for_the_touch_window_only(env):
-  clock, _, make_device = env
-  dev = make_device()
-  fade_fully(clock, dev)
-  dev._interaction_time = clock.t + 10  # touch with a 10 s interactive timeout
-  vals = step(clock, dev, round(ONROAD_DIM_WAKE_TIME / DT))
-  assert vals[-1] == 50
-  vals = step(clock, dev, round(10.0 / DT) - round(ONROAD_DIM_WAKE_TIME / DT) - 1)
-  assert set(vals) == {50}
-  # the touch does not push the quiet hold: fading begins right after the touch window, not 10 s later
-  step(clock, dev, 2)
-  assert 0.0 < dev._dim_fraction <= 2 * DT / ONROAD_DIM_FADE_TIME
-  fade_fully(clock, dev)
-
-
-def test_alert_clearing_holds_then_fades_and_a_new_alert_restarts_the_hold(env):
-  clock, sm, make_device = env
-  dev = make_device(100)
-  fade_fully(clock, dev)
-  sm['selfdriveState'].alertSize = AlertSize.small
-  assert step(clock, dev, round(2.0 / DT))[-1] == 100
-  sm['selfdriveState'].alertSize = AlertSize.none
-  assert_holds_then_fades(clock, dev, 100)
-
-  sm['selfdriveState'].alertSize = AlertSize.small
-  step(clock, dev, round(2.0 / DT))
-  sm['selfdriveState'].alertSize = AlertSize.none
-  assert set(step(clock, dev, round(5.0 / DT))) == {100}  # halfway through the hold
-  sm['selfdriveState'].alertSize = AlertSize.small  # one alert frame inside the hold
-  assert step(clock, dev)[-1] == 100
-  sm['selfdriveState'].alertSize = AlertSize.none
-  assert_holds_then_fades(clock, dev, 100)  # the full hold again from that frame, not the remaining 5 s
-
-
-@pytest.mark.parametrize('cause', ['override', 'stale'])
-def test_override_or_stale_then_engaged_fresh_holds_before_fading(env, monkeypatch, cause):
-  clock, sm, make_device = env
-  dev = make_device()
-  fade_fully(clock, dev)
-  if cause == 'override':
-    monkeypatch.setattr(ui_state, 'status', UIStatus.OVERRIDE)
+  dev = make_device(0.0)
+  assert step(clock, dev, 20)[-1] == ONROAD_DIM_BRIGHTNESS
+  if stale in ('alive', 'valid'):
+    getattr(sm, stale)['selfdriveState'] = False
   else:
-    sm.alive['selfdriveState'] = False
-  assert step(clock, dev, round(3.0 / DT))[-1] == 50
-  if cause == 'override':
-    monkeypatch.setattr(ui_state, 'status', UIStatus.ENGAGED)
-  else:
-    sm.alive['selfdriveState'] = True
-  assert_holds_then_fades(clock, dev, 50)
+    sm.recv_frame['selfdriveState'] = STARTED_FRAME if stale == 'recv_frame_equal' else STARTED_FRAME - 5
+  assert step(clock, dev) == [ONROAD_ALERT_BRIGHTNESS]
+  assert set(step(clock, dev, round(20.0 / DT))) == {ONROAD_ALERT_BRIGHTNESS}
 
 
-@pytest.mark.parametrize('size,status', [(AlertSize.mid, AlertStatus.critical), (AlertSize.full, AlertStatus.normal)])
-def test_critical_or_full_alert_restores_ambient_on_the_first_frame(env, size, status):
+def test_after_the_alert_it_eases_back_over_the_release_time(env):
   clock, sm, make_device = env
-  dev = make_device(100)
-  fade_fully(clock, dev)
-  sm['selfdriveState'].alertSize = size
-  sm['selfdriveState'].alertStatus = status
-  assert step(clock, dev)[-1] == 100
-  assert dev._brightness_target == 100
-
-  # the alert is gone on the next frame: that frame starts the hold, no immediate re-fade
+  dev = make_device(0.0)
+  sm['selfdriveState'].alertSize = AlertSize.small
+  step(clock, dev, 20)
   sm['selfdriveState'].alertSize = AlertSize.none
-  sm['selfdriveState'].alertStatus = AlertStatus.normal
-  assert_holds_then_fades(clock, dev, 100)
+  n = round(ONROAD_ALERT_RELEASE_TIME / DT)
+  vals = step(clock, dev, n)
+  assert all(a >= b for a, b in zip(vals, vals[1:], strict=False))
+  assert ONROAD_DIM_BRIGHTNESS < vals[0] < ONROAD_ALERT_BRIGHTNESS  # not held, not dropped in one frame
+  assert abs(vals[n // 2 - 1] - (ONROAD_ALERT_BRIGHTNESS + ONROAD_DIM_BRIGHTNESS) / 2) <= 1  # linear: halfway at half the time
+  assert vals[-1] == ONROAD_DIM_BRIGHTNESS
+  assert set(step(clock, dev, 200)) == {ONROAD_DIM_BRIGHTNESS}
 
-
-def test_small_user_prompt_alert_still_ramps(env):
-  clock, sm, make_device = env
-  dev = make_device(100)
-  fade_fully(clock, dev)
+  # an alert that comes back during the release lifts it at once again
   sm['selfdriveState'].alertSize = AlertSize.small
-  sm['selfdriveState'].alertStatus = AlertStatus.userPrompt
-  assert step(clock, dev)[-1] < 20  # not instant
-  assert step(clock, dev, round(ONROAD_DIM_WAKE_TIME / DT) - 2)[-1] < 100
-  assert step(clock, dev)[-1] == 100  # about 1 s
-
-
-def test_going_offroad_resets_at_once(env, monkeypatch):
-  clock, _, make_device = env
-  dev = make_device()
-  fade_fully(clock, dev)
-  monkeypatch.setattr(ui_state, 'started', False)
-  assert step(clock, dev)[-1] == 50
-  assert dev._dim_fraction == 0.0
-  assert dev._brightness_target == 50
-
-  # coming back onroad starts the fade from full ambient, not from the old fraction
-  monkeypatch.setattr(ui_state, 'started', True)
-  assert step(clock, dev)[-1] >= 49
-
-
-def test_stall_between_updates_is_clamped(env):
-  clock, sm, make_device = env
-  dev = make_device(100)
-  step(clock, dev)
-  before = dev._dim_fraction
-  step(clock, dev, dt=10.0)
-  assert dev._dim_fraction - before == pytest.approx(0.25 / ONROAD_DIM_FADE_TIME)
-
-  fade_fully(clock, dev)
-  sm['selfdriveState'].alertSize = AlertSize.small
-  step(clock, dev, dt=10.0)
-  assert dev._dim_fraction == pytest.approx(1.0 - 0.25 / ONROAD_DIM_WAKE_TIME)
-
-
-def test_not_awake_still_yields_zero(env):
-  clock, sm, make_device = env
-  dev = make_device()
-  dev._awake = False
-  assert set(step(clock, dev, 50)) == {0}
+  step(clock, dev, 20)
+  sm['selfdriveState'].alertSize = AlertSize.none
+  assert step(clock, dev, n // 2)[-1] < ONROAD_ALERT_BRIGHTNESS
   sm['selfdriveState'].alertSize = AlertSize.full
-  assert set(step(clock, dev, 50)) == {0}
-  assert dev._brightness_target == 0
+  sm['selfdriveState'].alertStatus = AlertStatus.critical
+  assert step(clock, dev) == [ONROAD_ALERT_BRIGHTNESS]
+
+
+def test_an_alert_never_dims_a_brighter_screen(env):
+  clock, sm, make_device = env
+  dev = make_device(99.5)
+  bright = step(clock, dev, 20)[-1]
+  assert bright > ONROAD_ALERT_BRIGHTNESS
+  sm['selfdriveState'].alertSize = AlertSize.full
+  sm['selfdriveState'].alertStatus = AlertStatus.critical
+  assert set(step(clock, dev, 40)) == {bright}
+  sm['selfdriveState'].alertSize = AlertSize.none
+  assert set(step(clock, dev, 40)) == {bright}
+
+
+def test_asleep_gives_zero(env):
+  clock, sm, make_device = env
+  for light in (0.0, 99.5):
+    dev = make_device(light)
+    dev._awake = False
+    assert set(step(clock, dev, 50)) == {0}
+    sm['selfdriveState'].alertSize = AlertSize.full
+    sm['selfdriveState'].alertStatus = AlertStatus.critical
+    assert set(step(clock, dev, 50)) == {0}
+    assert dev._brightness_target == 0
+    sm['selfdriveState'].alertSize = AlertSize.none
+
+
+def test_offroad_is_unchanged(env, monkeypatch):
+  # offroad: the offroad brightness through the ambient filter, nothing else; alerts and the light sensor are ignored
+  clock, sm, make_device = env
+  dev = make_device(0.0)
+  sm['selfdriveState'].alertSize = AlertSize.full
+  assert step(clock, dev)[-1] == ONROAD_ALERT_BRIGHTNESS
+  monkeypatch.setattr(ui_state, 'started', False)
+  ref = FirstOrderFilter(dev._brightness_filter.x, 10.0, dev._brightness_filter.dt)
+  assert step(clock, dev, 300) == [round(ref.update(BACKLIGHT_OFFROAD)) for _ in range(300)]  # the lift ends at once
+  dev.set_offroad_brightness(100)
+  sm.alive['selfdriveState'] = False
+  assert step(clock, dev, 300) == [round(ref.update(100)) for _ in range(300)]
+
+  # back onroad without a light reading: the offroad brightness, as before
+  monkeypatch.setattr(ui_state, 'started', True)
+  monkeypatch.setattr(ui_state, 'light_sensor', -1)
+  sm.alive['selfdriveState'] = True
+  sm['selfdriveState'].alertSize = AlertSize.none
+  assert step(clock, dev, 300) == [round(ref.update(100)) for _ in range(300)]
