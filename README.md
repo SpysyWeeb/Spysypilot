@@ -45,6 +45,17 @@ for entry, and behind a relevant lead it never counts. With nobody ahead, Experi
 signs and slowing for some turns, for 6–17 s in the replay; the model plans to roll through a stop sign, not to stop, and the
 mode can return to Chill before the line, so the stop at a sign stays the driver's. None of this is field validated.
 
+Since D48–D50 (2026-11-12, after four of the owner's bookmarks where the mode did not switch in) the switch is easier. A lead the
+radar loses keeps the model's stop out for 0.5 s instead of 3 s while the car rolls; a lead last seen with the car at rest still
+keeps it out for 3 s, because at a launch the model's stop bit lags the opening plan (D48). A lead moving at 1 m/s or more that
+is more than 5 m past the model's stop point of the last second (a car that has already gone through the light) no longer vetoes
+the switch or re-arms that guard; a stopped or creeping lead, and any lead with the car at a crawl, vetoes as before (D49). Below
+13 m/s with nobody relevant ahead, a straight plan that ends within 60 m, no faster than the car and at 4.5 m/s or less, with the
+model asking at most +0.3 m/s², switches the mode in like D47's reading, and while the mode is on such a plan (its end up to
+6.5 m/s) holds it (D50). With nobody ahead Experimental therefore comes on more often at low speed, in car parks, at slow turns
+taken without a blinker and on stop-sign approaches, and stays on while the model's plan stays slow and short. All of this is from
+open-loop replays of logged drives; none of it is field validated.
+
 A radar lead lost while the car brakes behind it stays in the plan: a lead the MPC saw on two frames in a row is kept,
 moving along its last trajectory, for the rest of the seven-frame absence hold while the car moves, and when it is gone
 for good cruise takes the car on from the published target at the cruise jerk instead of jumping (BLoTv3 D43). The planner
@@ -121,6 +132,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Conditional Experimental Mode slowing hold and go exit: BLoTv3 `5dac58958257cb6a14b432a07e206b4a9f73881f` (D41), applied unchanged; `conditional_experimental_mode.py`, `stop_helpers.py` and their tests match BLoTv3's, and the design document carries D40/D41.
 - Conditional Experimental Mode lead ownership: BLoTv3 `4390b44f22c75f60375b57737c1a9c4af9d884d9` (D42), applied unchanged; the MPC's stopping geometry moves to `longitudinal_mpc_lib/constants.py` so selfdrived does not load the solver. Narrowed natively on daily by D46 (2026-11-09): only a queue owns the stop, so `stop_helpers.py`, a comment in `conditional_experimental_mode.py` and their tests now differ from BLoTv3's, and selfdrived no longer loads the constants module. Not field validated.
 - Conditional Experimental Mode low-speed entry: native on daily, D47 (2026-11-09): `StopObservation.slowing_approach` in `stop_helpers.py`, read only by `conditional_experimental_mode.py` as entry evidence below 13 m/s; Force Stops, the planner and the landing do not read it. Not field validated.
+- Conditional Experimental Mode easier entry: native on daily, D48–D50 (2026-11-12): the recent-lead guard 0.5 s rolling and 3 s at rest, a moving lead past the model's stop point no longer vetoes, and `StopObservation.slow_plan` / `slow_plan_hold` in `stop_helpers.py`, read only by `conditional_experimental_mode.py` below 13 m/s; each rule has its own off switch (`LEAD_RELEASE_HYSTERESIS_S = 3.0`, `LEAD_BEYOND_STOP_MEMORY_S = 0.0`, `SLOW_PLAN_MAX_DISTANCE = 0.0`). Not field validated.
 - Lead kept through its absence hold, one reading of lead presence: BLoTv3 `4eaa4f4131ecd1048791632659e7d69e4213da99` (D43), composed with daily's lane-change release and restore (a released lead is never kept), its landing urgency window (leadOne reads the kept lead; its window counts from the radar's loss and ends no sooner than the keep, and that expiry is the one hand-back of the lead's room) and its model-forecast health gate (on a frame radarState fails, the leads stay and only the forecasts fall back). The radar-invalid lead hiding, which daily had extended to leadTwo, is retired with BLoTv3's; the design document carries D43.
 
 - Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. Its lateral behavior is unchanged by the subsequent longitudinal passing import.
