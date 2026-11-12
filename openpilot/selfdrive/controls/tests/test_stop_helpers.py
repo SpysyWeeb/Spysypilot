@@ -7,8 +7,8 @@ from openpilot.selfdrive.controls.lib.stop_helpers import (LEAD_CRAWL_SPEED, STO
                                                            STOP_EARLY_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_CONFIDENCE,
                                                            STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
                                                            STOP_EARLY_MIN_SPEED, STOP_TRAJECTORY_CONFIDENCE, SLOW_PLAN_MAX_DESIRED_ACCEL,
-                                                           SLOW_PLAN_MAX_DISTANCE, SLOW_PLAN_MAX_END_SPEED, SLOW_PLAN_MIN_SPEED,
-                                                           lead_owns_stop, leads_clear_of_stop_path, observe_model_stop, stop_release_open)
+                                                           SLOW_PLAN_HOLD_MAX_END_SPEED, SLOW_PLAN_MAX_DISTANCE, SLOW_PLAN_MAX_END_SPEED,
+                                                           SLOW_PLAN_MIN_SPEED, lead_owns_stop, leads_clear_of_stop_path, observe_model_stop, stop_release_open)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
@@ -325,6 +325,24 @@ class TestSlowPlan:
     obs = observe(rolling(), car_state(5.3), radar_state(d_one=25.0, v_one=5.0))
     assert obs.slow_plan and obs.relevant_lead
 
+  def test_the_hold_reading_allows_an_end_up_to_its_own_limit(self):
+    # slow_plan_hold, CEM's hold: the same plan with SLOW_PLAN_HOLD_MAX_END_SPEED for its end (route 0x1f8 t=539.3-540.4: the end at
+    # 4.5-6.4 m/s, the model asking -0.15 to -0.42)
+    cs = car_state(7.0)
+    for end in (SLOW_PLAN_MAX_END_SPEED, 5.5, SLOW_PLAN_HOLD_MAX_END_SPEED):
+      obs = observe(rolling(v_ego=7.0, end=end, path_end=50.0, desired_accel=-0.3), cs)
+      assert obs.slow_plan_hold and obs.slow_plan == (end <= SLOW_PLAN_MAX_END_SPEED)
+    assert not observe(rolling(v_ego=7.0, end=SLOW_PLAN_HOLD_MAX_END_SPEED + 0.1, path_end=50.0), cs).slow_plan_hold
+    # no faster than the car, and every other condition as slow_plan's
+    assert observe(rolling(), car_state(5.3)).slow_plan_hold
+    assert not observe(rolling(end=5.4), car_state(5.3)).slow_plan_hold
+    assert not observe(rolling(v_ego=7.0, end=5.5, path_end=SLOW_PLAN_MAX_DISTANCE + 0.5), cs).slow_plan_hold
+    assert not observe(rolling(v_ego=7.0, end=5.5, desired_accel=SLOW_PLAN_MAX_DESIRED_ACCEL + 0.01), cs).slow_plan_hold
+    assert not observe(rolling(v_ego=7.0, end=5.5), car_state(7.0, blinker=True)).slow_plan_hold
+    for v_ego in (STOP_EARLY_MIN_SPEED, 14.0):
+      assert not observe(rolling(v_ego=v_ego, end=5.0), car_state(v_ego)).slow_plan_hold
+
   def test_switched_off_at_zero_distance(self, monkeypatch):
     monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
     assert not observe(rolling(), car_state(5.3)).slow_plan
+    assert not observe(rolling(v_ego=7.0, end=5.5), car_state(7.0)).slow_plan_hold

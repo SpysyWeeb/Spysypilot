@@ -149,9 +149,11 @@ class ConditionalExperimentalMode:
       self._lead_release_active = True
     entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or obs.committed_turn
 
-    # below the early tiers' speed, with no relevant radar lead (the observation's own reading, D49 aside), a short plan rolling on no
-    # faster than the car and at 4.5 m/s or less, the model not asking to speed up (D50)
+    # below the early tiers' speed, with no relevant radar lead (the observation's own reading, not D49's far-lead one), a short plan
+    # rolling on no faster than the car and at 4.5 m/s or less, the model not asking to speed up (D50). Holding a mode that is on, the
+    # plan may end at up to SLOW_PLAN_HOLD_MAX_END_SPEED: one limit for both was a cliff the mode fell off and climbed back over
     slow_plan = obs.slow_plan and not obs.relevant_lead
+    slow_plan_hold = obs.slow_plan_hold and not obs.relevant_lead
     evidence = obs.confidence
     if not self.experimental_mode and (obs.slowing_approach or slow_plan):
       # below the early tiers' speed, a slowing, straight plan with the model braking enters at the hint's confidence (D47), and so
@@ -160,7 +162,7 @@ class ConditionalExperimentalMode:
       # holds a mode they entered is below
       evidence = max(evidence, STOP_EARLY_HINT_ENTRY_CONFIDENCE)
     confidence = evidence if self.experimental_mode or not entry_veto else 0.0
-    if self.experimental_mode and (obs.slowing or slow_plan):
+    if self.experimental_mode and (obs.slowing or slow_plan_hold):
       # a plan still shedding most of the speed has not reached the stop, even when it relaunches before its end, and a plan still
       # rolling slowly to a short end with nobody ahead has not left it (D50: its end reads as open road at 3 m/s and more, and the
       # open-road count would cancel the hold a second after entry and flicker the mode off and on): trajectory evidence, so neither

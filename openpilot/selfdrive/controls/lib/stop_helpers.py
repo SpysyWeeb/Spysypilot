@@ -50,6 +50,9 @@ SLOW_PLAN_MAX_DISTANCE = 60.0      # m, the plan ends within this
 SLOW_PLAN_MAX_END_SPEED = 4.5      # m/s, at or below this, and no faster than the car is going now
 SLOW_PLAN_MAX_DESIRED_ACCEL = 0.3  # m/s^2, the model asking no more than this
 SLOW_PLAN_MIN_SPEED = 1.0          # m/s, the car rolling above this: at a crawl the strict tier and the stop bit decide, as before
+SLOW_PLAN_HOLD_MAX_END_SPEED = 6.5  # m/s, the end speed limit for holding a mode that is on (slow_plan_hold); entry keeps 4.5. A single
+                                    # limit was a cliff: 0x1f8 t=539.3-540.4 the plan's end rose to 4.5-6.4 m/s with the model asking
+                                    # -0.15 to -0.42, and the mode ended itself a tick before the driver's brake. 4.5 removes the margin
 
 COMMITTED_TURN_MAX_SPEED = 8.0
 COMMITTED_TURN_MIN_STEERING_DEG = 35.0
@@ -77,6 +80,7 @@ class StopObservation:
   slowing_approach: bool = False  # below STOP_EARLY_MIN_SPEED: slowing, straight, toward a point ahead, the model braking (D47; CEM entry only)
   slow_plan: bool = False         # below STOP_EARLY_MIN_SPEED: straight, a short plan rolling on no faster than the car, the model not
                                   # asking to speed up (D50; CEM alone reads it)
+  slow_plan_hold: bool = False    # slow_plan with the hold's end speed limit, SLOW_PLAN_HOLD_MAX_END_SPEED (D50; CEM's hold alone)
 
 
 def _finite(values):
@@ -174,9 +178,11 @@ def observe_model_stop(model, car_state, radar_state):
   slowing_approach = (v_ego < STOP_EARLY_MIN_SPEED and slowing and straight and path_end > 0.0
                       and desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX)
   # the plan's reading alone, as slowing_approach: the lead condition is CEM's. A request that cannot be read is no reading
-  slow_plan = (SLOW_PLAN_MIN_SPEED < v_ego < STOP_EARLY_MIN_SPEED and straight and 0.0 < path_end <= SLOW_PLAN_MAX_DISTANCE
-               and terminal_speed <= min(v_ego, SLOW_PLAN_MAX_END_SPEED) and math.isfinite(action.desiredAcceleration)
-               and action.desiredAcceleration <= SLOW_PLAN_MAX_DESIRED_ACCEL)
+  slow_rolling = (SLOW_PLAN_MIN_SPEED < v_ego < STOP_EARLY_MIN_SPEED and straight and 0.0 < path_end <= SLOW_PLAN_MAX_DISTANCE
+                  and terminal_speed <= v_ego and math.isfinite(action.desiredAcceleration)
+                  and action.desiredAcceleration <= SLOW_PLAN_MAX_DESIRED_ACCEL)
+  slow_plan = slow_rolling and terminal_speed <= SLOW_PLAN_MAX_END_SPEED
+  slow_plan_hold = slow_rolling and terminal_speed <= max(SLOW_PLAN_MAX_END_SPEED, SLOW_PLAN_HOLD_MAX_END_SPEED)
 
   if action.shouldStop:
     confidence = STOP_DIRECT_CONFIDENCE
@@ -197,7 +203,7 @@ def observe_model_stop(model, car_state, radar_state):
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
                          relevant, lead_present(radar_state), committed_turn, stop_release_open(model),
                          path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing,
-                         relevant and lead_owns_stop(radar_state, v_ego, path_end), slowing_approach, slow_plan)
+                         relevant and lead_owns_stop(radar_state, v_ego, path_end), slowing_approach, slow_plan, slow_plan_hold)
 
 
 def lane_changing(model):

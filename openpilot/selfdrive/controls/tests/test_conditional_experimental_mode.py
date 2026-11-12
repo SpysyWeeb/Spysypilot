@@ -11,8 +11,8 @@ from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (Cond
                                                                             LEAD_RELEASE_HYSTERESIS_S, MODE_MIN_LATCH_S, POST_STOP_SUPPRESS_S,
                                                                             STANDSTILL_MIN_LATCH_S, STOP_INTENT_HOLD_S, STOP_RELEASE_HYSTERESIS_S,
                                                                             CLEAR_CANCEL_S)
-from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_MIN_SPEED,
-                                                           StopObservation)
+from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, SLOW_PLAN_HOLD_MAX_END_SPEED, SLOW_PLAN_MAX_END_SPEED,
+                                                           STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_MIN_SPEED, StopObservation)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
@@ -777,7 +777,9 @@ class TestLowSpeedApproach:
     monkeypatch.setattr('openpilot.selfdrive.controls.lib.conditional_experimental_mode.observe_model_stop', lambda *args: slowing)
     assert run(cem, STOP_INTENT_HOLD_S + STOP_RELEASE_HYSTERESIS_S + 0.5, model())
 
-  def test_the_plan_still_slowing_holds_a_mode_it_entered(self):
+  def test_the_plan_still_slowing_holds_a_mode_it_entered(self, monkeypatch):
+    # D47's hold alone: the murky plan below ends within 60 m at 6.5 m/s below the car's speed, which D50's hold reads as a slow plan
+    self.without_d50(monkeypatch)
     cem, cs = ConditionalExperimentalMode(), car_state(LOW_SPEED_APPROACH)
     assert run_frames(cem, self.red_light(), cs, radar_state()) is not None
     # the model eases its request, the plan still sheds the speed: D41's term holds the mode past the 4 s hold
@@ -849,6 +851,22 @@ class TestSlowPlan:
     assert run_frames(cem, [slow_plan()] * 40, cs, radar_state()) is not None
     for tick in range(round(10.0 / DT_CTRL)):
       assert cem.update(slow_plan(), cs, radar_state(), controls_enabled=True, model_updated=tick % TICKS_PER_FRAME == 0, model_valid=True)
+
+  def test_the_hold_takes_a_faster_end_than_entry(self, monkeypatch):
+    # route 0x1f8 t=539.3-540.4: the plan's end rose to 4.5-6.4 m/s with the model asking -0.15 to -0.42; with one 4.5 m/s limit for
+    # entry and hold the mode ended itself a tick before the driver's brake. Holding, the end may reach SLOW_PLAN_HOLD_MAX_END_SPEED
+    cs, faster = car_state(7.0), slow_plan(7.0, 6.0, 50.0, -0.3)
+    out = CLEAR_CANCEL_S + STOP_RELEASE_HYSTERESIS_S + 0.5
+    assert self.entry_tick([faster] * 40, cs) is None
+    cem = ConditionalExperimentalMode()
+    assert run_frames(cem, [slow_plan()] * 40, car_state(SLOW_PLAN_SPEED), radar_state()) is not None
+    assert run(cem, 10.0, faster, cs)
+    assert not run(cem, out, slow_plan(7.0, SLOW_PLAN_HOLD_MAX_END_SPEED + 0.2, 50.0, -0.3), cs)
+    # one limit for both, as first built: the cliff
+    monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_HOLD_MAX_END_SPEED', SLOW_PLAN_MAX_END_SPEED)
+    cem = ConditionalExperimentalMode()
+    assert run_frames(cem, [slow_plan()] * 40, car_state(SLOW_PLAN_SPEED), radar_state()) is not None
+    assert not run(cem, out, faster, cs)
 
   def test_the_mode_ends_when_the_plan_launches(self):
     cem, cs = ConditionalExperimentalMode(), car_state(SLOW_PLAN_SPEED)
