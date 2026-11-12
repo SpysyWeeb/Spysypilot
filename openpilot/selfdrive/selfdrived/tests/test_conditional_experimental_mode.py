@@ -83,9 +83,7 @@ def test_a_yellow_light_the_lead_goes_through_requests_experimental():
   assert sd.experimental_mode
 
 
-def test_a_creeping_red_light_with_no_car_ahead_requests_experimental():
-  # route 0x1ef t=210.5 (2026-11-09, D47): at 10 m/s with no lead, the plan dipping to a walking pace and creeping on above 1 m/s while
-  # the model's request falls through -0.25 on the ninth frame; Experimental is requested within the hint tier's filter and debounce
+def creeping_red_light_request_time():
   data = {'modelV2': model(), 'radarState': messaging.new_message('radarState').radarState}
   sd = selfdrived(False, False, data=data)
   sd.conditional_experimental_mode = ConditionalExperimentalMode()
@@ -99,5 +97,16 @@ def test_a_creeping_red_light_with_no_car_ahead_requests_experimental():
     SelfdriveD.update_experimental_mode(sd, cs)
     if sd.experimental_mode and requested is None:
       requested = tick * DT_CTRL
-  # the first braking frame is the ninth (0.40 s); the filter and the debounce take 0.60 s more
+  return requested
+
+
+def test_a_creeping_red_light_with_no_car_ahead_requests_experimental(monkeypatch):
+  # route 0x1ef t=210.5 (2026-11-09, D47): at 10 m/s with no lead, the plan dipping to a walking pace and creeping on above 1 m/s while
+  # the model's request falls through -0.25 on the ninth frame; Experimental is requested within the hint tier's filter and debounce.
+  # Since D50 the plan, ending slowly within 60 m with nobody ahead, is entry evidence from its first frame: 0.60 s
+  requested = creeping_red_light_request_time()
+  assert requested is not None and 0.55 <= requested <= 0.65
+  # D47's reading alone: the first braking frame is the ninth (0.40 s); the filter and the debounce take 0.60 s more
+  monkeypatch.setattr('openpilot.selfdrive.controls.lib.stop_helpers.SLOW_PLAN_MAX_DISTANCE', 0.0)
+  requested = creeping_red_light_request_time()
   assert requested is not None and 0.95 <= requested <= 1.05
