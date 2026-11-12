@@ -11,7 +11,8 @@ owner's drive.
 BLoTv3 restructures [BLoTv2](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2) from `stock`.
 It keeps BLoTv2's tuned behavior where BLoTv2 was right and fixes the verified defects; it does
 not add tuning knobs or toggles. Standalone BLoTv3 runs on the stock opendbc pointer
-(`ACCEL_MAX = 2.0`); `combo` runs the same code on the fork opendbc/panda lineage (4.0 m/s²).
+(`ACCEL_MAX = 2.0`); `combo`, retired on 2026-11-12 (its last commit is tagged `archive/combo-2026-11-12`), ran the
+same code on the fork opendbc/panda lineage (4.0 m/s²).
 
 ## Daily integration (local; not field validated)
 
