@@ -92,19 +92,27 @@ class TestEntry:
     cem = ConditionalExperimentalMode()
     direct = model(should_stop=True, desired_accel=-0.3)
     assert not run(cem, 1.0, direct, rs=radar_state(d_one=20.0))
-    assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - 0.5, direct)
+    # the lead gone for less than the guard: its evidence is still zeroed, and the lead coming back re-arms the guard
+    assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, direct)
+    assert cem.intent_filter.x == 0.0
+    assert not run(cem, 0.5, direct, rs=radar_state(d_one=20.0))
+    assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, direct)
     assert run(cem, 1.5, direct)
 
   def test_a_strict_stop_with_a_clear_corridor_releases_the_lead_guard_early(self):
     cem = ConditionalExperimentalMode()
     run(cem, 1.0, stop_model(), rs=radar_state(d_one=20.0))
+    # inside the guard the release already lets the evidence through
+    assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, stop_model())
+    assert cem._lead_release_active and cem.intent_filter.x > 0.0
     assert run(cem, 1.0, stop_model())
 
   def test_an_in_corridor_hypothesis_keeps_the_lead_guard(self):
     cem = ConditionalExperimentalMode()
     run(cem, 1.0, stop_model(), rs=radar_state(d_one=20.0))
     replacement = model(path_end=30.0, terminal_speed=0.2, desired_accel=-0.3, leads=((0.9, 200.0, 0.0), (0.2, 27.0, 0.3), (0.0, 20.0, 0.0)))
-    assert not run(cem, 1.0, replacement)
+    assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, replacement)
+    assert not cem._lead_release_active and cem.intent_filter.x == 0.0
 
   def test_a_raw_lead_on_a_control_tick_revokes_a_pending_release_only(self):
     cem = ConditionalExperimentalMode()
@@ -439,7 +447,7 @@ class TestYellowLight:
   def entry_tick(self, rs, frames=None, cs=None):
     cem = ConditionalExperimentalMode()
     cs = cs if cs is not None else car_state(YELLOW_LIGHT_SPEED)
-    # a second of cruising behind the lead first, so its 3 s guard is running when the stop appears, as it was on the road
+    # a second of cruising behind the lead first, so its guard is running when the stop appears, as it was on the road
     run(cem, 1.0, model(path_end=140.0, terminal_speed=YELLOW_LIGHT_SPEED), cs, rs)
     assert not cem.experimental_mode
     return run_frames(cem, frames if frames is not None else [yellow_light_stop(i) for i in range(40)], cs, rs)
@@ -475,6 +483,38 @@ class TestYellowLight:
     nan = float('nan')
     assert self.entry_tick(yellow_light_lead(nan)) is None
     assert self.entry_tick(radar_state(d_one=20.0, v_one=YELLOW_LIGHT_SPEED, d_two=nan, v_two=YELLOW_LIGHT_SPEED)) is None
+
+
+LOST_LEAD_SPEED = 19.7
+
+
+class TestLostLead:
+  # route 0x207 t=346.1-350.4 (2026-11-11): 44 mph toward a red light after a bend, the lead gone through it and lost by the radar at
+  # t=346.9; the model planned the stop on the early tier from t=347.7, but the 3 s guard the lost lead left zeroed that evidence, the
+  # corridor release needs a strict frame, and the driver braked at t=350.4 (0x201 t=115.7-120.3 the same). The guard is 0.5 s (D48)
+
+  def entry_time(self, rs_before, frames=60):
+    # a second behind a moving lead on an ordinary plan (each frame re-arms the guard), then the lead is gone and the stop is planned
+    cem, cs = ConditionalExperimentalMode(), car_state(LOST_LEAD_SPEED)
+    run(cem, 1.0, model(path_end=150.0, terminal_speed=LOST_LEAD_SPEED), cs, rs_before)
+    assert not cem.experimental_mode
+    tick = run_frames(cem, [early_model(LOST_LEAD_SPEED)] * frames, cs, radar_state())
+    return None if tick is None else tick * DT_CTRL
+
+  def test_a_stop_planned_as_the_lead_is_lost_enters_after_the_short_guard(self):
+    no_lead = self.entry_time(radar_state())
+    lost = self.entry_time(radar_state(d_one=40.0, v_one=LOST_LEAD_SPEED))
+    assert no_lead is not None and lost is not None
+    # the guard still runs, and only the guard: entry comes its length after the time it takes with no lead
+    assert math.isclose(lost - no_lead, LEAD_RELEASE_HYSTERESIS_S, abs_tol=DT_MDL + 1e-9)
+    assert lost < 1.5
+
+  def test_the_lead_coming_back_inside_the_guard_still_blocks(self):
+    cem, cs = ConditionalExperimentalMode(), car_state(LOST_LEAD_SPEED)
+    lead = radar_state(d_one=40.0, v_one=LOST_LEAD_SPEED)
+    for _ in range(4):
+      assert not run(cem, 0.5, early_model(LOST_LEAD_SPEED), cs, lead)
+      assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, early_model(LOST_LEAD_SPEED), cs)
 
 
 LOW_SPEED_APPROACH = 10.0

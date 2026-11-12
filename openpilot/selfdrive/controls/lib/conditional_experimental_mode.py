@@ -22,7 +22,9 @@ STANDSTILL_MIN_LATCH_S = 1.0
 RESUME_RELEASE_SPEED = 0.8
 POST_STOP_SUPPRESS_S = 2.0
 DRIVER_OVERRIDE_SUPPRESS_S = 2.0
-LEAD_RELEASE_HYSTERESIS_S = 3.0
+LEAD_RELEASE_HYSTERESIS_S = 0.5  # s, the recent-lead guard (D48). 3.0 held the model's stop out of the switch for 3 s after the lead
+                                 # was lost: routes 0x207 t=346.9-350.4 (a red light after a bend) and 0x201 t=115.7-120.3 (traffic
+                                 # slowing ahead), the driver braking each time; 3.0 restores the guard as it was before D48
 GO_ROLL_SPEED = 1.0  # m/s, below this the open road alone is a go (a green at rest or a crawl); above it the model must launch
 GO_ACCEL = 0.5       # m/s^2
 GO_CONFIRM_S = 0.5   # s, longer than the model's brief open-road flashes at rest
