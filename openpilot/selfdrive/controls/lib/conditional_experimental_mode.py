@@ -1,9 +1,12 @@
+import math
+
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present
-from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE, STOP_EARLY_HINT_ENTRY_CONFIDENCE,
-                                                           STOP_SAMPLE_MIN_CONFIDENCE, STOP_TRAJECTORY_CONFIDENCE, StopObservation,
-                                                           model_complete_and_finite, observe_model_stop)
+from openpilot.selfdrive.controls.lib.stop_helpers import (LEAD_CRAWL_SPEED, MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE,
+                                                           STOP_EARLY_HINT_ENTRY_CONFIDENCE, STOP_SAMPLE_MIN_CONFIDENCE,
+                                                           STOP_TRAJECTORY_CONFIDENCE, StopObservation, model_complete_and_finite,
+                                                           observe_model_stop)
 
 # Requests Experimental mode for a confirmed model stop that no lead owns so the e2e candidate can plan the
 # approach; it never chooses a speed, an acceleration, a brake command or a stop point.
@@ -25,6 +28,11 @@ DRIVER_OVERRIDE_SUPPRESS_S = 2.0
 LEAD_RELEASE_HYSTERESIS_S = 0.5  # s, the recent-lead guard (D48). 3.0 held the model's stop out of the switch for 3 s after the lead
                                  # was lost: routes 0x207 t=346.9-350.4 (a red light after a bend) and 0x201 t=115.7-120.3 (traffic
                                  # slowing ahead), the driver braking each time; 3.0 restores the guard as it was before D48
+LEAD_BEYOND_STOP_MEMORY_S = 1.0  # s, the model's nearest stop point on the frames with stop evidence over this window (D49): a moving
+LEAD_BEYOND_STOP_MARGIN = 5.0    # m, lead this far past it has gone through the place the model stops, and is no relevant lead for the
+                                 # veto. Route 0x1fc t=1451.9-1455.8: a yellow light, the lead 80-86 m out past the junction; the plan
+                                 # alternated between a strict stop 42-55 m out and a longer one 79-103 m out that made the lead
+                                 # relevant, and every longer frame re-armed the guard. LEAD_BEYOND_STOP_MEMORY_S = 0.0 switches it off
 GO_ROLL_SPEED = 1.0  # m/s, below this the open road alone is a go (a green at rest or a crawl); above it the model must launch
 GO_ACCEL = 0.5       # m/s^2
 GO_CONFIRM_S = 0.5   # s, longer than the model's brief open-road flashes at rest
@@ -55,6 +63,7 @@ class ConditionalExperimentalMode:
     self._exit_revocable = False
     self._override_remaining = 0.0
     self._model_complete = True
+    self._stop_points = []
 
   def _clear_evidence(self):
     self.intent_filter.x = 0.0
@@ -64,6 +73,26 @@ class ConditionalExperimentalMode:
     self._clear_elapsed = 0.0
     self._intent_hold_remaining = 0.0
     self._lead_release_active = False
+    self._stop_points = []
+
+  def _lead_beyond_stop(self, obs, radar_state, v_ego):
+    # D49: remembers the model's stop point on each frame with stop evidence (any tier) over LEAD_BEYOND_STOP_MEMORY_S. A relevant lead
+    # is beyond the stop when every present radar lead can be read, is moving (not a queue: a stopped or creeping car past the model's
+    # stop point is what the model stops behind, D42) and is more than LEAD_BEYOND_STOP_MARGIN past the nearest remembered point. At a
+    # crawl a relevant lead keeps its veto, as before (a queue's creep and launch are the lead logic's)
+    frames = round(LEAD_BEYOND_STOP_MEMORY_S / self.model_dt)
+    if frames <= 0:
+      self._stop_points = []
+      return False
+    has_point = obs.confidence > 0.0 and obs.path_end is not None and math.isfinite(obs.path_end) and obs.path_end > 0.0
+    self._stop_points = (self._stop_points + [obs.path_end if has_point else None])[-frames:]
+    points = [p for p in self._stop_points if p is not None]
+    if not obs.relevant_lead or not points or not math.isfinite(v_ego) or v_ego < GO_ROLL_SPEED:
+      return False
+    nearest = min(points)
+    leads = [lead for lead in (radar_state.leadOne, radar_state.leadTwo) if lead.present]
+    return all(math.isfinite(lead.dRel) and math.isfinite(lead.vLead) and lead.vLead >= LEAD_CRAWL_SPEED
+               and lead.dRel > nearest + LEAD_BEYOND_STOP_MARGIN for lead in leads)
 
   def _deactivate(self, suppress_for):
     self.experimental_mode = False
@@ -87,13 +116,18 @@ class ConditionalExperimentalMode:
     # to judge: it carries the empty observation, exactly as an invalid model does
     obs = obs if radar_valid else StopObservation()
 
-    # a relevant lead vetoes a new handoff and starts a grace; on a near stop (strict, direct) at speed, a tracked lead that does
-    # not own it (since D46 any lead but a queue or an unreadable one) ends the veto at once. During the grace one strict frame may
-    # mint a revocable release if both raw leads are gone and every model lead hypothesis is outside the stop corridor
+    # a relevant lead vetoes a new handoff and starts a grace (LEAD_RELEASE_HYSTERESIS_S, D48); on a near stop (strict, direct) at
+    # speed, a tracked lead that does not own it (since D46 any lead but a queue or an unreadable one) ends the veto at once. A moving
+    # lead past the model's nearest stop point of the last second is no relevant lead here (D49): it neither vetoes nor re-arms the
+    # grace, nor owns the stop. During the grace one strict frame may mint a revocable release if both raw leads are gone and every
+    # model lead hypothesis is outside the stop corridor
+    beyond = self._lead_beyond_stop(obs, radar_state, car_state.vEgo)
+    relevant_lead = obs.relevant_lead and not beyond
+    lead_owns_stop = obs.lead_owns_stop and not beyond
     near_stop = obs.should_stop or obs.strict_stop
-    if obs.relevant_lead and (obs.lead_owns_stop or not near_stop or car_state.vEgo < GO_ROLL_SPEED):
+    if relevant_lead and (lead_owns_stop or not near_stop or car_state.vEgo < GO_ROLL_SPEED):
       self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
-    elif obs.relevant_lead:
+    elif relevant_lead:
       self._lead_veto_remaining = 0.0
     else:
       self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
@@ -110,8 +144,9 @@ class ConditionalExperimentalMode:
     evidence = obs.confidence
     if not self.experimental_mode and obs.slowing_approach:
       # below the early tiers' speed, a slowing, straight plan with the model braking enters at the hint's confidence (D47). It is no
-      # near stop, so a relevant lead vetoes it, and it is entry evidence only: below the hold's 0.8 it could not refresh the hold of
-      # an active mode either, and every frame carrying it is slowing, which holds the mode below
+      # near stop, so a relevant lead vetoes it (one moving past the model's stop excepted, D49), and it is entry evidence only: below
+      # the hold's 0.8 it could not refresh the hold of an active mode either, and every frame carrying it is slowing, which holds the
+      # mode below
       evidence = max(evidence, STOP_EARLY_HINT_ENTRY_CONFIDENCE)
     confidence = evidence if self.experimental_mode or not entry_veto else 0.0
     if self.experimental_mode and obs.slowing:

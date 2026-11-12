@@ -4,8 +4,10 @@ import sys
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL, DT_MDL
+from openpilot.selfdrive.controls.lib import conditional_experimental_mode as cem_module
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (ConditionalExperimentalMode, DRIVER_OVERRIDE_SUPPRESS_S,
-                                                                            GO_ACCEL, GO_CONFIRM_S, GO_ROLL_SPEED, LEAD_RELEASE_HYSTERESIS_S,
+                                                                            GO_ACCEL, GO_CONFIRM_S, GO_ROLL_SPEED, LEAD_BEYOND_STOP_MARGIN,
+                                                                            LEAD_BEYOND_STOP_MEMORY_S, LEAD_RELEASE_HYSTERESIS_S,
                                                                             MODE_MIN_LATCH_S, POST_STOP_SUPPRESS_S, STANDSTILL_MIN_LATCH_S,
                                                                             STOP_INTENT_HOLD_S, STOP_RELEASE_HYSTERESIS_S, CLEAR_CANCEL_S)
 from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_MIN_SPEED,
@@ -515,6 +517,95 @@ class TestLostLead:
     for _ in range(4):
       assert not run(cem, 0.5, early_model(LOST_LEAD_SPEED), cs, lead)
       assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, early_model(LOST_LEAD_SPEED), cs)
+
+
+JUNCTION_SPEED = 14.3
+JUNCTION_STOP = 48.0
+
+
+def junction_frames(n, pattern=(0, 0, 1)):
+  # route 0x1fc t=1451.9-1455.8: the plan alternating between a strict stop 42-55 m out and a longer, slowing plan 79-103 m out
+  # (the hint tier), the longer one putting the relevant-lead window past a lead 80-86 m ahead
+  return [model(path_end=95.0, terminal_speed=3.0, desired_accel=-0.5) if pattern[i % len(pattern)] else
+          model(path_end=JUNCTION_STOP, terminal_speed=0.2, desired_accel=-1.0) for i in range(n)]
+
+
+def through_the_junction(d_two=None, v_two=14.0):
+  # the car ahead went through the yellow: 83 m out at 14 m/s, past the model's stop point
+  return radar_state(d_one=83.0, v_one=14.0, d_two=d_two, v_two=v_two)
+
+
+class TestLeadBeyondTheStop:
+  # route 0x1fc t=1451.9-1455.8 (2026-11-11): 32 mph toward a light turning yellow, the lead 80-86 m out already past the junction. Every
+  # longer plan made that lead relevant and re-armed the guard, the mode never entered and the car crossed the line at the end of the
+  # yellow. A moving lead past the model's nearest stop point of the last second is no relevant lead for the veto (D49)
+
+  def approach(self, rs, frames=None, cs=None):
+    # a second behind the lead on an ordinary plan (its guard running), then the light: the control tick of entry and the guard per frame
+    cem, cs = ConditionalExperimentalMode(), cs if cs is not None else car_state(JUNCTION_SPEED)
+    run(cem, 1.0, model(path_end=140.0, terminal_speed=JUNCTION_SPEED), cs, rs)
+    assert not cem.experimental_mode
+    entry, guard = None, []
+    for i, md in enumerate(frames if frames is not None else junction_frames(60)):
+      for k in range(TICKS_PER_FRAME):
+        if cem.update(md, cs, rs, controls_enabled=True, model_updated=k == 0, model_valid=True) and entry is None:
+          entry = i * TICKS_PER_FRAME + k
+      guard.append(cem._lead_veto_remaining)
+    return entry, guard
+
+  def test_a_lead_through_the_junction_no_longer_re_arms_the_guard(self):
+    entry, guard = self.approach(through_the_junction())
+    assert all(b <= a for a, b in zip(guard, guard[1:], strict=False))
+    # the guard the lead left before the light runs out, then the filter and the debounce
+    assert entry is not None and entry * DT_CTRL < LEAD_RELEASE_HYSTERESIS_S + 1.0
+
+  def test_the_rule_switched_off_keeps_the_guard_armed(self, monkeypatch):
+    monkeypatch.setattr(cem_module, 'LEAD_BEYOND_STOP_MEMORY_S', 0.0)
+    entry, guard = self.approach(through_the_junction())
+    assert entry is None and max(guard) == LEAD_RELEASE_HYSTERESIS_S
+
+  def test_a_lead_nearer_than_beyond_the_stop_point_vetoes_as_before(self, monkeypatch):
+    # a moving lead short of the stop, a car that will stop short of the line, a queue past the model's stop point (D42), a far queue,
+    # a nearer lead in the second slot, and a lead whose speed or place cannot be read: the same frames with the rule on and off
+    nan = float('nan')
+    cases = (radar_state(d_one=40.0, v_one=14.0), radar_state(d_one=JUNCTION_STOP - 5.0, v_one=4.0),
+             radar_state(d_one=JUNCTION_STOP + 12.0, v_one=0.0), radar_state(d_one=83.0, v_one=0.5), through_the_junction(d_two=45.0),
+             through_the_junction(d_two=45.0, v_two=0.0), radar_state(d_one=83.0, v_one=nan), through_the_junction(d_two=nan),
+             radar_state(d_one=JUNCTION_STOP + LEAD_BEYOND_STOP_MARGIN, v_one=14.0))
+    on = [self.approach(rs) for rs in cases]
+    monkeypatch.setattr(cem_module, 'LEAD_BEYOND_STOP_MEMORY_S', 0.0)
+    assert on == [self.approach(rs) for rs in cases]
+    assert all(entry is None for entry, _ in on[:4])
+
+  def test_at_a_crawl_the_lead_keeps_its_veto(self):
+    stub = [model(path_end=1.5, terminal_speed=0.2, should_stop=True)] * 40
+    for v_ego in (0.0, GO_ROLL_SPEED - 0.5):
+      assert self.approach(radar_state(d_one=9.0, v_one=1.2), stub, car_state(v_ego, standstill=v_ego == 0.0))[0] is None
+
+  def test_the_stop_point_is_remembered_for_a_second_only(self):
+    cem, cs, rs = ConditionalExperimentalMode(), car_state(JUNCTION_SPEED), through_the_junction()
+    run(cem, 0.5, model(path_end=JUNCTION_STOP, terminal_speed=0.2, desired_accel=-1.0), cs, rs)
+    ordinary = model(path_end=140.0, terminal_speed=JUNCTION_SPEED)
+    # the lead is in the window of the ordinary plan; while the strict stop point is remembered it is past it
+    run(cem, LEAD_BEYOND_STOP_MEMORY_S - 2 * DT_MDL, ordinary, cs, rs)
+    assert cem._lead_veto_remaining < LEAD_RELEASE_HYSTERESIS_S
+    run(cem, 2 * DT_MDL, ordinary, cs, rs)
+    assert cem._lead_veto_remaining == LEAD_RELEASE_HYSTERESIS_S
+
+  def test_the_stop_point_is_forgotten_on_disengagement_reset_and_cleared_evidence(self):
+    cs, rs, ordinary = car_state(JUNCTION_SPEED), through_the_junction(), model(path_end=140.0, terminal_speed=JUNCTION_SPEED)
+    strict = model(path_end=JUNCTION_STOP, terminal_speed=0.2, desired_accel=-1.0)
+    for forget in (lambda cem: run(cem, DT_CTRL, strict, cs, rs, enabled=False), lambda cem: cem.reset(),
+                   lambda cem: run(cem, DT_CTRL, strict, car_state(JUNCTION_SPEED, brake=True), rs),
+                   lambda cem: cem._clear_evidence()):
+      cem = ConditionalExperimentalMode()
+      run(cem, 0.3, strict, cs, rs)
+      assert cem._stop_points
+      forget(cem)
+      assert cem._stop_points == []
+      cem._override_remaining = 0.0
+      run(cem, DT_MDL, ordinary, cs, rs)
+      assert cem._lead_veto_remaining == LEAD_RELEASE_HYSTERESIS_S
 
 
 LOW_SPEED_APPROACH = 10.0
