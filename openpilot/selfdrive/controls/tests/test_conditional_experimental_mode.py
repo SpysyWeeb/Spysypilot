@@ -7,9 +7,10 @@ from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib import conditional_experimental_mode as cem_module
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (ConditionalExperimentalMode, DRIVER_OVERRIDE_SUPPRESS_S,
                                                                             GO_ACCEL, GO_CONFIRM_S, GO_ROLL_SPEED, LEAD_BEYOND_STOP_MARGIN,
-                                                                            LEAD_BEYOND_STOP_MEMORY_S, LEAD_RELEASE_HYSTERESIS_S,
-                                                                            MODE_MIN_LATCH_S, POST_STOP_SUPPRESS_S, STANDSTILL_MIN_LATCH_S,
-                                                                            STOP_INTENT_HOLD_S, STOP_RELEASE_HYSTERESIS_S, CLEAR_CANCEL_S)
+                                                                            LEAD_BEYOND_STOP_MEMORY_S, LEAD_RELEASE_HYSTERESIS_AT_REST_S,
+                                                                            LEAD_RELEASE_HYSTERESIS_S, MODE_MIN_LATCH_S, POST_STOP_SUPPRESS_S,
+                                                                            STANDSTILL_MIN_LATCH_S, STOP_INTENT_HOLD_S, STOP_RELEASE_HYSTERESIS_S,
+                                                                            CLEAR_CANCEL_S)
 from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_EARLY_HINT_DESIRED_ACCEL_MAX, STOP_EARLY_MIN_SPEED,
                                                            StopObservation)
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -518,6 +519,44 @@ class TestLostLead:
       assert not run(cem, 0.5, early_model(LOST_LEAD_SPEED), cs, lead)
       assert not run(cem, LEAD_RELEASE_HYSTERESIS_S - DT_MDL, early_model(LOST_LEAD_SPEED), cs)
 
+  def test_the_short_guard_is_half_a_second(self):
+    # in absolute terms, so a different value cannot pass against its own constant: one model frame more than 0.5 s at most (the
+    # countdown's float residue)
+    lost = self.entry_time(radar_state(d_one=40.0, v_one=LOST_LEAD_SPEED))
+    assert 0.45 <= lost - self.entry_time(radar_state()) <= 0.6
+
+
+class TestLeadLeavingAtRest:
+  # route 0x1f3 t=22.8-24.0 (as if engaged): at rest behind a car 17 m ahead that drove off. The plan opened to 22-31 m ending at 4-6 m/s
+  # while the model's stop bit lagged it by about a second; with the 0.5 s guard that stale bit switched the mode for 1.8 s at the launch
+  # and the planner then asked -0.2 to -0.84 m/s^2 where Chill asked +0.9. A lead armed below GO_ROLL_SPEED keeps the 3 s guard (D48)
+
+  def entry_time(self, v_ego, rs_before):
+    cs = car_state(v_ego, standstill=v_ego == 0.0)
+    cem = ConditionalExperimentalMode()
+    stale = model(path_end=25.0, terminal_speed=5.0, should_stop=True, desired_accel=0.3)
+    run(cem, 1.0, model(), cs, rs_before)
+    assert not cem.experimental_mode
+    tick = run_frames(cem, [stale] * 100, cs, radar_state())
+    return None if tick is None else tick * DT_CTRL
+
+  def test_a_lead_leaving_at_rest_keeps_the_long_guard(self):
+    no_lead = self.entry_time(0.0, radar_state())
+    assert no_lead is not None
+    lost = self.entry_time(0.0, radar_state(d_one=17.0, v_one=0.0))
+    assert math.isclose(lost - no_lead, LEAD_RELEASE_HYSTERESIS_AT_REST_S, abs_tol=DT_MDL + 1e-9)
+
+  def test_rolling_the_same_frames_get_the_short_guard(self):
+    rolling = GO_ROLL_SPEED + 0.5
+    lost = self.entry_time(rolling, radar_state(d_one=17.0, v_one=0.0))
+    assert math.isclose(lost - self.entry_time(rolling, radar_state()), LEAD_RELEASE_HYSTERESIS_S, abs_tol=DT_MDL + 1e-9)
+
+  def test_both_at_three_seconds_is_the_guard_before_d48(self, monkeypatch):
+    monkeypatch.setattr(cem_module, 'LEAD_RELEASE_HYSTERESIS_S', 3.0)
+    rolling = GO_ROLL_SPEED + 0.5
+    lost = self.entry_time(rolling, radar_state(d_one=17.0, v_one=0.0))
+    assert math.isclose(lost - self.entry_time(rolling, radar_state()), 3.0, abs_tol=DT_MDL + 1e-9)
+
 
 JUNCTION_SPEED = 14.3
 JUNCTION_STOP = 48.0
@@ -576,6 +615,26 @@ class TestLeadBeyondTheStop:
     monkeypatch.setattr(cem_module, 'LEAD_BEYOND_STOP_MEMORY_S', 0.0)
     assert on == [self.approach(rs) for rs in cases]
     assert all(entry is None for entry, _ in on[:4])
+
+  def test_a_near_stop_with_a_moving_lead_past_it_still_ends_the_veto_at_once(self, monkeypatch):
+    # D46 ends the veto at once on a strict stop with a moving lead; D49 must not turn that into a countdown. A strict stop 30 m out
+    # and the lead 40 m out at 14 m/s: as first built, D49 entered 0.5 s later than with D49 off
+    cs, cases = car_state(14.6), ((30.0, 40.0), (30.0, 45.0), (45.0, 55.0))
+
+    def entries(lead=True):
+      return [self.approach(radar_state(d_one=d_lead, v_one=14.0) if lead else radar_state(),
+                            [model(path_end=stop, terminal_speed=0.2, desired_accel=-1.0)] * 40, cs)[0] for stop, d_lead in cases]
+    on = entries()
+    assert None not in on and on == entries(lead=False)
+    monkeypatch.setattr(cem_module, 'LEAD_BEYOND_STOP_MEMORY_S', 0.0)
+    assert on == entries()
+
+  def test_only_frames_with_stop_evidence_leave_a_stop_point(self):
+    cem, cs = ConditionalExperimentalMode(), car_state(JUNCTION_SPEED)
+    run(cem, DT_MDL, model(path_end=30.0, terminal_speed=JUNCTION_SPEED), cs, radar_state())
+    assert cem._stop_points == [None]
+    run(cem, DT_MDL, model(path_end=JUNCTION_STOP, terminal_speed=0.2, desired_accel=-1.0), cs, radar_state())
+    assert cem._stop_points == [None, JUNCTION_STOP]
 
   def test_at_a_crawl_the_lead_keeps_its_veto(self):
     stub = [model(path_end=1.5, terminal_speed=0.2, should_stop=True)] * 40

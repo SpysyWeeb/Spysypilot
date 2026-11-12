@@ -25,14 +25,20 @@ STANDSTILL_MIN_LATCH_S = 1.0
 RESUME_RELEASE_SPEED = 0.8
 POST_STOP_SUPPRESS_S = 2.0
 DRIVER_OVERRIDE_SUPPRESS_S = 2.0
-LEAD_RELEASE_HYSTERESIS_S = 0.5  # s, the recent-lead guard (D48). 3.0 held the model's stop out of the switch for 3 s after the lead
-                                 # was lost: routes 0x207 t=346.9-350.4 (a red light after a bend) and 0x201 t=115.7-120.3 (traffic
-                                 # slowing ahead), the driver braking each time; 3.0 restores the guard as it was before D48
-LEAD_BEYOND_STOP_MEMORY_S = 1.0  # s, the model's nearest stop point on the frames with stop evidence over this window (D49): a moving
-LEAD_BEYOND_STOP_MARGIN = 5.0    # m, lead this far past it has gone through the place the model stops, and is no relevant lead for the
-                                 # veto. Route 0x1fc t=1451.9-1455.8: a yellow light, the lead 80-86 m out past the junction; the plan
-                                 # alternated between a strict stop 42-55 m out and a longer one 79-103 m out that made the lead
-                                 # relevant, and every longer frame re-armed the guard. LEAD_BEYOND_STOP_MEMORY_S = 0.0 switches it off
+LEAD_RELEASE_HYSTERESIS_S = 0.5  # s, the recent-lead guard while rolling (D48). 3.0 held the model's stop out of the switch for 3 s
+                                 # after the lead was lost: routes 0x207 t=346.9-350.4 (a red light after a bend) and 0x201
+                                 # t=115.7-120.3 (traffic slowing ahead), the driver braking each time; 3.0 restores the guard as it
+                                 # was before D48. It counts down on model frames: the stop evidence of the 10 frames after the
+                                 # lead's last one is zeroed (60 at 3.0; the float countdown leaves a residue on the last frame)
+LEAD_RELEASE_HYSTERESIS_AT_REST_S = 3.0  # s, the guard a lead armed with the car below GO_ROLL_SPEED (D48). At rest the model's stop bit
+                                         # lags the plan opening by about a second once the queue launches, and 0.5 s let that stale bit
+                                         # switch the mode at the launch (route 0x1f3 t=22.8-24.0, as if engaged)
+# D49, a lead past the model's stop point: LEAD_BEYOND_STOP_MEMORY_S = 0.0 switches it off. Route 0x1fc t=1451.9-1455.8: a yellow light,
+# the lead 80-86 m out past the junction; the plan alternated between a strict stop 42-55 m out and a longer one 79-103 m out that made
+# the lead relevant, and every longer frame re-armed the guard
+LEAD_BEYOND_STOP_MEMORY_S = 1.0  # s, the window over which the model's nearest stop point is remembered (frames with stop evidence)
+LEAD_BEYOND_STOP_MARGIN = 5.0    # m, a lead moving at LEAD_CRAWL_SPEED or more and farther than this past that point is no relevant
+                                 # lead for the veto: it has gone through the place the model stops
 GO_ROLL_SPEED = 1.0  # m/s, below this the open road alone is a go (a green at rest or a crawl); above it the model must launch
 GO_ACCEL = 0.5       # m/s^2
 GO_CONFIRM_S = 0.5   # s, longer than the model's brief open-road flashes at rest
@@ -116,18 +122,20 @@ class ConditionalExperimentalMode:
     # to judge: it carries the empty observation, exactly as an invalid model does
     obs = obs if radar_valid else StopObservation()
 
-    # a relevant lead vetoes a new handoff and starts a grace (LEAD_RELEASE_HYSTERESIS_S, D48); on a near stop (strict, direct) at
-    # speed, a tracked lead that does not own it (since D46 any lead but a queue or an unreadable one) ends the veto at once. A moving
-    # lead past the model's nearest stop point of the last second is no relevant lead here (D49): it neither vetoes nor re-arms the
-    # grace, nor owns the stop. During the grace one strict frame may mint a revocable release if both raw leads are gone and every
-    # model lead hypothesis is outside the stop corridor
+    # a relevant lead vetoes a new handoff and starts a grace (D48: LEAD_RELEASE_HYSTERESIS_S rolling, the longer
+    # LEAD_RELEASE_HYSTERESIS_AT_REST_S with the car below GO_ROLL_SPEED); on a near stop (strict, direct) at speed, a tracked lead that
+    # does not own it (since D46 any lead but a queue or an unreadable one) ends the veto at once. A moving lead past the model's nearest
+    # stop point of the last second is no relevant lead for the veto (D49): it neither vetoes nor re-arms the grace, nor owns the stop,
+    # and on a near stop it still ends the veto at once, as D46 has it. During the grace one strict frame may mint a revocable release
+    # if both raw leads are gone and every model lead hypothesis is outside the stop corridor
     beyond = self._lead_beyond_stop(obs, radar_state, car_state.vEgo)
     relevant_lead = obs.relevant_lead and not beyond
     lead_owns_stop = obs.lead_owns_stop and not beyond
     near_stop = obs.should_stop or obs.strict_stop
     if relevant_lead and (lead_owns_stop or not near_stop or car_state.vEgo < GO_ROLL_SPEED):
-      self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
-    elif relevant_lead:
+      self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S if car_state.vEgo >= GO_ROLL_SPEED else LEAD_RELEASE_HYSTERESIS_AT_REST_S
+    elif obs.relevant_lead and near_stop:
+      # a lead beyond the stop reads as moving, readable and the car rolling, so on a near stop this is D46's case whatever D49 says
       self._lead_veto_remaining = 0.0
     else:
       self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
