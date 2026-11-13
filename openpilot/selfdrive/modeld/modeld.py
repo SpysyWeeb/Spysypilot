@@ -10,7 +10,8 @@ os.environ['GMMU'] = '0' # for chestnut fast loading, noop for qcom
 os.environ.setdefault('AM_POWER_LIMIT', '100')
 from tinygrad.device import Buffer, Device
 from tinygrad.dtype import DType, dtypes
-from tinygrad.engine.realize import lower_and_compile
+from tinygrad.engine.jit import CapturedJit
+from tinygrad.engine.realize import compile_linear, lower_and_compile
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context, round_up
 from tinygrad.uop.ops import UOp
@@ -79,12 +80,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                 shouldStop=bool(stop))
 
 
-def drop_chestnut() -> None:
-  if "AMD" in Device._opened_devices:
-    for d in Device._opened_devices:
-      Device[d].pending.pop(Device["AMD"], None)
-
-
 class ChestnutGpuState:
   # GPU metrics require modeld's GPU context
   def __init__(self, pm: PubMaster, big: bool):
@@ -142,15 +137,22 @@ class FrameMeta:
 
 
 def input_view(buffer: Buffer, shape: tuple[int, ...], dtype: DType, offset: int) -> Tensor:
-  view = buffer.view(math.prod(shape), dtype, offset).ensure_allocated()
-  return Tensor(UOp.from_buffer(view)).reshape(shape)
+  view = buffer.view(math.prod(shape) * dtype.itemsize, offset).ensure_allocated()
+  return Tensor(UOp.from_buffer(view, dtype)).reshape(shape)
+
+
+def compile_copy(tensor: Tensor) -> Callable[[], Tensor]:
+  # one compiled copy, replayed every frame, instead of building a copy graph on each call
+  jit = CapturedJit(tensor, compile_linear(tensor.schedule_linear()), [], [])
+  return lambda: jit([], {})
 
 
 class Upload(NamedTuple):
   # one host buffer and its copy on a device: float inputs at 128-byte offsets, then a tail of frame bytes
   packed: np.ndarray
-  host: Buffer
-  device: Buffer
+  host: Tensor
+  device: Tensor
+  copy: Callable[[], Tensor]  # uploads packed's current bytes to device
   views: dict[str, Tensor]
   npy_size: int
 
@@ -184,6 +186,7 @@ class ModelState:
     for name, next_name in self.state_pairs.items():
       state = self.input_queues[name]
       self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype, 0)
+    self.copy_outputs = compile_copy(self.outputs['outputs'].to('CPU'))
     self.parser = Parser()
 
   def pack_inputs(self) -> None:
@@ -202,21 +205,25 @@ class ModelState:
       self.model_input = self.pack(shapes, math.prod(warped_shape), self.model_device)
       self.frame_input = self.pack(tfm, frames_size, self.warp_device)
       self.warped = self.model_input.packed[self.model_input.npy_size:]
-      self.input_queues['new_img'] = input_view(self.model_input.device, warped_shape, dtypes.uint8, self.model_input.npy_size)
+      self.input_queues['new_img'] = input_view(self.model_input.device._buffer(), warped_shape, dtypes.uint8, self.model_input.npy_size)
     self.input_queues |= {name: view for name, view in self.model_input.views.items() if name != 'tfm'}
     self.frames = self.frame_input.packed[self.frame_input.npy_size:].reshape(2, self.frame_copy_size)
-    self.warp_inputs = {'input_frame': input_view(self.frame_input.device, self.frames.shape, dtypes.uint8, self.frame_input.npy_size),
+    self.warp_inputs = {'input_frame': input_view(self.frame_input.device._buffer(), self.frames.shape, dtypes.uint8, self.frame_input.npy_size),
                         'M_inv': self.frame_input.views['tfm']}
 
   def pack(self, shapes: dict[str, tuple[int, ...]], tail: int, device: str) -> Upload:
     npy_size = sum(round_up(math.prod(shape) * 4, 128) for shape in shapes.values())
     packed = np.zeros(npy_size + tail, dtype=np.uint8)
-    dev, views, offset = Tensor(packed, device=device)._buffer(), {}, 0
+    host = Tensor(packed, device='NPY')
+    dev = host.to(device)
+    copy = compile_copy(dev)
+    copy()
+    views, offset = {}, 0
     for name, shape in shapes.items():
       self.npy[name] = np.ndarray(shape, dtype=np.float32, buffer=packed, offset=offset)
-      views[name] = input_view(dev, shape, dtypes.float32, offset)
+      views[name] = input_view(dev._buffer(), shape, dtypes.float32, offset)
       offset += round_up(self.npy[name].nbytes, 128)
-    return Upload(packed, Tensor(packed, device='NPY')._buffer(), dev, views, npy_size)
+    return Upload(packed, host, dev, copy, views, npy_size)
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     return {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
@@ -234,18 +241,20 @@ class ModelState:
     self.npy['traffic_convention'][:] = inputs['traffic_convention']
     self.npy['action_t'][:] = inputs['action_t']
 
-    self.frame_input.device.copy_from(self.frame_input.host)
+    self.frame_input.copy()
     new_img = self.run_warp(**self.warp_inputs)
     if self.warp_device == self.model_device:
       self.input_queues['new_img'] = new_img
     else:
       # the warped frames join the other inputs in the model device's upload
       np.copyto(self.warped, np.frombuffer(new_img._buffer().as_memoryview(allow_zero_copy=True), dtype=np.uint8))
-      self.model_input.device.copy_from(self.model_input.host)
+      self.model_input.copy()
     self.run_model(output_buffers=self.outputs, **self.input_queues)
+    if self.chestnut and (err := Device[self.outputs['outputs'].device].error_state.host.view(fmt='q')[0]):
+      raise RuntimeError(f"chestnut failed with {err}")
     if after_enqueue is not None:
       after_enqueue()
-    model_output = self.outputs['outputs'].numpy()[0]
+    model_output = self.copy_outputs().numpy()[0]
     if self.chestnut and not np.all(np.isfinite(model_output)):
       raise RuntimeError("model output not finite")
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
@@ -361,8 +370,6 @@ def main(demo=False):
       params.put_bool("OnroadCycleRequested", True)
     else:
       params.put_bool("ChestnutActive", model is not None)
-    if model is None:
-      drop_chestnut()
 
   small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
   if model is None:
@@ -499,7 +506,6 @@ def main(demo=False):
         raise
       # fallback to small model
       cloudlog.exception("big model failed, fall back to small")
-      drop_chestnut()
       params.put_bool("ChestnutActive", False)
       model = small_model
       if chestnut_state is not None:
