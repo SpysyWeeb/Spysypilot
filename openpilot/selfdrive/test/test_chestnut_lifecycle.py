@@ -61,7 +61,8 @@ def test_main_action_tracks_inactive_curvature_without_changing_active_or_moving
   with pytest.raises(FrameCaptured):
     modeld.main()
   assert len(actions) == 1
-  expected = (curvature if not lat_active else 0.) if speed <= 0.3 else 0.02 / max(1., speed) ** 2
+  # the big model's lateral output is divided by speed squared, floored at 2.5 m/s (upstream #39182)
+  expected = (curvature if not lat_active else 0.) if speed <= 0.3 else 0.02 / max(2.5, speed) ** 2
   assert actions[0].desiredCurvature == pytest.approx(expected)
   assert 'controlsState' in subscribed, 'the seed must have a live messaging subscription'
 
