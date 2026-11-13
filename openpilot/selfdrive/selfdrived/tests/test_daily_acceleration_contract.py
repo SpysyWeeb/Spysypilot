@@ -10,7 +10,9 @@ from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck, Exce
 
 
 def test_daily_host_hyundai_and_launch_envelope_match_the_selected_ceiling():
-  assert ACCEL_MAX == CarControllerParams.ACCEL_MAX == get_max_accel(0.0) == 4.0
+  # the selected command ceiling stays 4.0; D51 put Chill's launch envelope at rest below it, at 2.1
+  assert ACCEL_MAX == CarControllerParams.ACCEL_MAX == 4.0
+  assert get_max_accel(0.0) == 2.1
   assert ACCEL_MIN == CarControllerParams.ACCEL_MIN == -3.5
   assert get_max_accel(40.0) == 0.6
 

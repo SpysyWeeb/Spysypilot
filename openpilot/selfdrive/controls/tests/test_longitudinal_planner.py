@@ -23,8 +23,8 @@ from openpilot.selfdrive.controls.lib.necessity_supervisor import LEAD_DEPARTURE
 from openpilot.selfdrive.controls.lib.stop_helpers import PATH_OPEN_LENGTH, STOP_PREDICTION_HORIZON_S
 from openpilot.selfdrive.controls.lib.stop_landing import KISS_DECEL, LEAD_MIN_GAP_BUDGET, STANDSTILL_SPEED
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
-                                                                   A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
+from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_GATE_LAUNCH, A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED,
+                                                                   A_CRUISE_MAX_SPEED, A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
                                                                    LongitudinalPlanner, get_cruise_accel, get_cruise_comfort_accel,
                                                                    get_max_accel, get_max_accel_request, ordinary_cruise_comfort_enabled)
 from openpilot.selfdrive.test.longitudinal_maneuvers.plant import ActuatorLag, Plant, _PlantSubMaster, palisade_car_params
@@ -146,11 +146,15 @@ class TestAccelEnvelope:
     # the floor is reached with zero slope, not a corner
     assert abs(requests[-1] - requests[-2]) < 1e-4
 
-  def test_deployed_platform_clamps_the_request(self):
-    assert ACCEL_MAX <= A_CRUISE_MAX_LAUNCH
-    assert math.isclose(get_max_accel(0.0), ACCEL_MAX, rel_tol=1e-6, abs_tol=1e-9)
-    assert abs((get_max_accel(20.0)) - (1.025)) <= 1e-3
-    assert abs((get_max_accel(30.0)) - (0.653)) <= 1e-3
+  def test_deployed_platform_clamps_the_request(self, monkeypatch):
+    # D51: Chill's ceiling at standstill (2.1) lies below the fork's vehicle ceiling (4.0), which no longer clamps it; the stock
+    # opendbc pin (2.0) still would
+    assert (A_CRUISE_MAX_LAUNCH, ACCEL_MAX) == (2.1, 4.0)
+    assert math.isclose(get_max_accel(0.0), 2.1, rel_tol=1e-6, abs_tol=1e-9)
+    assert abs((get_max_accel(20.0)) - (0.7875)) <= 1e-3
+    assert abs((get_max_accel(30.0)) - (0.6234)) <= 1e-3
+    monkeypatch.setattr(longitudinal_planner, 'ACCEL_MAX', 2.0)
+    assert math.isclose(get_max_accel(0.0), 2.0, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_jerk_schedule_bounds_the_first_step(self):
     v_ego = 75.0 * CV.MPH_TO_MS
@@ -219,7 +223,9 @@ class TestCruiseComfort:
       target = 0.0
       for _ in range(200):
         target = get_cruise_accel(False, v_cruise, v_ego, target, target, DT_MDL, -0.3, False, comfort)
-      assert math.isclose(target, np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]), rel_tol=1e-6, abs_tol=1e-9)
+      expected = min(get_max_accel(v_ego), np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego, A_CRUISE_GATE_LAUNCH), -0.3]))
+      assert math.isclose(target, expected, rel_tol=1e-6, abs_tol=1e-9)
+      assert math.isclose(target, 1.0514, abs_tol=1e-4)  # the gate's value before D51: D51 does not change it
 
   def test_comfort_blends_in_between_8_and_15_mps(self):
     v_ego = 11.5
@@ -255,6 +261,113 @@ class TestSetSpeedDrop:
     assert outputs[-1] < -0.2
 
 
+def gate_limit_before_d51(v_ego, coast):
+  # the no-throttle gate's limit as d9d0b51 computed it, written out: the 4.0 ceiling blended toward the coast value over 2.5-5 m/s
+  ceiling = min(float(0.6 + (4.0 - 0.6) * (1.0 - np.clip(v_ego / 40., 0.0, 1.0)) ** 3), 4.0)
+  return min(ceiling, float(np.interp(v_ego, [2.5, 5.0], [ceiling, max(coast, -3.5)])))
+
+
+def settled_gate(v_ego, coast):
+  target = 0.0
+  for _ in range(300):
+    target = get_cruise_accel(False, v_ego + 10.0, v_ego, target, target, DT_MDL, coast, False)
+  return target
+
+
+class TestLaunchCeiling:
+  # D51: Chill's cruise ceiling at standstill is A_CRUISE_MAX_LAUNCH = 2.1; A_CRUISE_MAX_LAUNCH = 4.0 is the rollback
+  def test_the_no_throttle_gate_brakes_no_harder_than_before(self):
+    # with the model's gas-press probability low the gate blends toward the coast value; its limit is d9d0b51's to the last bit
+    # wherever that lies below the 2.1 ceiling, and the 2.1 ceiling elsewhere
+    kept = capped = 0
+    for coast in (0.3, -0.3, -0.8, -1.2, -4.0):
+      for v_ego in np.arange(2.5, 5.0001, 0.05):
+        before = gate_limit_before_d51(v_ego, coast)
+        ceiling = min(float(0.6 + (2.1 - 0.6) * (1.0 - np.clip(v_ego / 40., 0.0, 1.0)) ** 3), 4.0)
+        target = settled_gate(v_ego, coast)
+        if before < ceiling:
+          kept += 1
+          assert target == before, (coast, v_ego, target, before)
+        else:
+          capped += 1
+          assert target == ceiling, (coast, v_ego, target, ceiling)
+    assert kept > 50 and capped > 20
+
+  def test_the_rollback_value_is_the_planner_before_d51(self, monkeypatch):
+    monkeypatch.setattr(longitudinal_planner, 'A_CRUISE_MAX_LAUNCH', 4.0)
+    for v in np.arange(-1.0, 45.0, 0.001):
+      assert get_max_accel_request(v) == float(0.6 + (4.0 - 0.6) * (1.0 - np.clip(v / 40., 0.0, 1.0)) ** 3), v
+    for coast in (0.3, -0.3, -0.8, -1.2, -4.0):
+      for v_ego in np.arange(2.5, 5.0001, 0.05):
+        assert settled_gate(v_ego, coast) == gate_limit_before_d51(v_ego, coast), (coast, v_ego)
+
+  def test_experimental_mode_does_not_read_it(self, monkeypatch):
+    def cruise(launch):
+      monkeypatch.setattr(longitudinal_planner, 'A_CRUISE_MAX_LAUNCH', launch)
+      return [get_cruise_accel(True, v + 10.0, v, a, a, DT_MDL, -0.3, True) for v in np.arange(0.0, 20.0, 0.5) for a in (0.0, 1.0, 3.0)]
+    assert cruise(2.1) == cruise(4.0)
+
+    def launch(value, experimental):
+      monkeypatch.setattr(longitudinal_planner, 'A_CRUISE_MAX_LAUNCH', value)
+      car, log = IdealCar(0.0), []
+      for _ in range(round(8.0 / DT_MDL)):
+        log.append((car.v, car.step(experimental=experimental, e2e_accel=3.0, path=(120.0, 15.0), v_cruise=20.0)))
+      return log
+    # the model asks 3 m/s^2 from rest: Experimental publishes the same targets either way, above the 2.1 ceiling...
+    lowered = launch(2.1, True)
+    assert lowered == launch(4.0, True)
+    assert any(a > get_max_accel(v, 2.1) + 0.5 for v, a in lowered if 2.0 <= v <= 12.0)
+    # ...where Chill, the same launch, is held to it
+    assert launch(2.1, False) != launch(4.0, False)
+
+  def test_a_clear_launch_asks_less_after_the_first_moments_and_ends_at_the_set_speed(self, monkeypatch):
+    # through the real planner and LongControl on the maneuver plant (a car that applies the request): from rest, nobody ahead,
+    # set speed 20 m/s, as shipped against the rollback
+    def launch(value=None):
+      if value is not None:
+        monkeypatch.setattr(longitudinal_planner, 'A_CRUISE_MAX_LAUNCH', value)
+      plant, log = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False, CP=PALISADE_CP), []
+      while plant.current_time < 40.0:
+        v_seen = plant.speed
+        plant.step(v_cruise=20.0)
+        log.append((plant.current_time, v_seen, float(plant.planner.output_a_target)))
+      return np.array(log)
+    lowered, before = launch(), launch(4.0)
+    t = lowered[:, 0]
+    # the first moments, the climb at the cruise jerk up to ~1.9 m/s^2, are untouched
+    first = t <= 0.95
+    assert np.array_equal(lowered[first, 2], before[first, 2])
+    # after them it asks less, at its peak and at every speed (the request against the speed it was planned from)
+    later = (t >= 1.5) & (t <= 5.0)
+    assert np.max(before[later, 2] - lowered[later, 2]) >= 1.0
+    assert np.max(lowered[:, 2]) <= 2.1 + 1e-9 < np.max(before[:, 2])
+    climbing = lowered[:, 1] < 19.0
+    at_speed = np.interp(lowered[climbing, 1], before[:, 1], before[:, 2])
+    assert np.all(lowered[climbing, 2] <= at_speed + 1e-6)
+    # the end speed is the set speed either way
+    assert abs(lowered[-1, 1] - 20.0) < 0.1 and abs(before[-1, 1] - 20.0) < 0.1
+
+  def test_a_launch_behind_a_lead_brakes_no_harder(self):
+    # a lead leaving from 6 m ahead at 2.5 m/s^2 to 14 m/s, then braking at 2 m/s^2 to 6 m/s: the 2.1 launch asks less on the way up,
+    # brakes no harder at its hardest than the rollback and keeps at least its gap (the two cars are not at the same place at the
+    # same instant, so the braking is compared by its hardest value, not instant by instant)
+    def launch(value):
+      with patch.object(longitudinal_planner, 'A_CRUISE_MAX_LAUNCH', value):
+        plant, log, v_lead = Plant(speed=0.0, distance_lead=6.0, lead_relevancy=True, CP=PALISADE_CP), [], 0.0
+        while plant.current_time < 25.0:
+          t = plant.current_time
+          if t >= 0.5:
+            v_lead = min(v_lead + 2.5 * DT_MDL, 14.0) if t < 12.0 else max(v_lead - 2.0 * DT_MDL, 6.0)
+          plant.step(v_lead=v_lead, v_cruise=20.0)
+          log.append((plant.speed, float(plant.planner.output_a_target), plant.distance_lead - plant.distance))
+      return np.array(log)
+    lowered, before = launch(2.1), launch(4.0)
+    assert np.max(before[:, 1] - lowered[:, 1]) >= 0.3
+    assert np.min(before[:, 1]) < -0.5
+    assert np.min(lowered[:, 1]) >= np.min(before[:, 1]) - 1e-6, (np.min(lowered[:, 1]), np.min(before[:, 1]))
+    assert np.min(lowered[:, 2]) >= np.min(before[:, 2]) - 0.05, (np.min(lowered[:, 2]), np.min(before[:, 2]))
+
+
 class TestPlannerCruise:
   def run_plant(self, seconds, **kwargs):
     plant = Plant(**kwargs)
@@ -265,16 +378,23 @@ class TestPlannerCruise:
     return plant, log
 
   def test_standstill_launch_starts_smooth_and_grows_quickly(self):
-    # owner acceptance: the plan starts smooth, then asks at least half the envelope within a second; cruise owns this launch
-    plant, log = self.run_plant(1.2, speed=0.0, distance_lead=200.0, lead_relevancy=False, CP=PALISADE_CP)
+    # owner acceptance (D4) was: the plan starts smooth, asks half the envelope within ~1 s, with no dip -- against a 4.0 ceiling at
+    # rest the request only rose in the first second. D51 lowered Chill's ceiling at rest to 2.1, so now: smooth start, a climb at
+    # the cruise jerk without a dip to half of that ceiling by ~0.6 s, the ceiling met at about 1 m/s and ~1 s, and from there the
+    # request follows the ceiling down as the speed rises (the ceiling falls with speed); cruise owns this launch
+    plant, log = self.run_plant(2.5, speed=0.0, distance_lead=200.0, lead_relevancy=False, CP=PALISADE_CP)
     assert plant.planner.plan_source == LongitudinalPlanSource.cruise
-    first = [a for t, _, a in log if t <= 0.1]
-    assert max(first) <= np.interp(0.0, J_CRUISE_BP, J_CRUISE_VALS) * 0.1 + 1e-6
-    by_one_second = [a for t, v, a in log if 0.9 <= t <= 1.0]
-    v_at_one = [v for t, v, _ in log if 0.9 <= t <= 1.0][-1]
-    assert max(by_one_second) >= 0.5 * get_max_accel(v_at_one)
-    accels = [a for _, _, a in log]
-    assert all(b >= a - 1e-6 for a, b in zip(accels, accels[1:], strict=False) if b < get_max_accel(0.0) - 1e-3)
+    t, v, a = (np.array(x) for x in zip(*log, strict=True))
+    v_seen = np.concatenate([[0.0], v[:-1]])   # the speed the planner planned each step from
+    assert np.max(a[t <= 0.1]) <= 2.0 * 0.1 + 1e-6
+    assert np.max(a[t <= 0.6]) >= 0.5 * 2.1
+    ceiling = np.array([get_max_accel(x) for x in v_seen])
+    meet = int(np.argmax(a >= ceiling - 1e-6))
+    assert a[meet] >= ceiling[meet] - 1e-6 and 0.9 <= t[meet] <= 1.2 and 0.8 <= v_seen[meet] <= 1.5, (t[meet], v_seen[meet])
+    # the climb has no dip; where it meets the ceiling the step is at most the ceiling's own fall over one frame
+    assert np.all(np.diff(a[:meet]) >= -1e-6) and a[meet] >= a[meet - 1] - 0.01
+    assert np.all(np.abs(a[meet:] - ceiling[meet:]) <= 1e-6)
+    assert a[-1] < a[meet] - 0.1
 
   def test_lead_launch_starts_smooth_because_the_change_cost_stays_on(self, monkeypatch):
     # behind a departing lead the MPC owns the launch; keeping the change cost through standstill softens its first step

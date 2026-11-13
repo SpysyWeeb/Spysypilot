@@ -28,7 +28,13 @@ from openpilot.common.swaglog import cloudlog
 
 # one convex curve from launch authority to the high speed floor, no speed node corners;
 # the deployed opendbc ACCEL_MAX clamps the request (2.0 stock, 4.0 with the fork's opendbc/panda)
-A_CRUISE_MAX_LAUNCH = 4.0
+# D51: Chill's cruise ceiling at standstill is 2.1 m/s^2, the single value that best matches the owner's own launches (his
+# 85th-percentile acceleration by speed); the car's ACCEL_MAX and Experimental mode's cruise ceiling stay 4.0.
+# ROLLBACK: A_CRUISE_MAX_LAUNCH = 4.0 restores the planner before D51 exactly
+A_CRUISE_MAX_LAUNCH = 2.1
+# the no-throttle gate blends from the ceiling as it was before D51 (this value at standstill); the lowered ceiling only caps the
+# gate's result, so the gate brakes no harder than it did
+A_CRUISE_GATE_LAUNCH = 4.0
 A_CRUISE_MAX_HIGH_SPEED = 0.6
 A_CRUISE_MAX_SPEED = 40.
 J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
@@ -55,12 +61,13 @@ LAUNCH_OPEN_CONFIRM = 0.7
 LAUNCH_CLOSE_LENGTH = 10.0
 LAUNCH_PATH_BACKWARD_SPEED = 5.0  # m/s, over the points' spacing; the path jitters back at rest, a reversal is faster
 
-def get_max_accel_request(v_ego):
+def get_max_accel_request(v_ego, launch=None):
   remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
-  return float(A_CRUISE_MAX_HIGH_SPEED + (A_CRUISE_MAX_LAUNCH - A_CRUISE_MAX_HIGH_SPEED) * remaining ** 3)
+  launch = A_CRUISE_MAX_LAUNCH if launch is None else launch
+  return float(A_CRUISE_MAX_HIGH_SPEED + (launch - A_CRUISE_MAX_HIGH_SPEED) * remaining ** 3)
 
-def get_max_accel(v_ego):
-  return min(get_max_accel_request(v_ego), ACCEL_MAX)
+def get_max_accel(v_ego, launch=None):
+  return min(get_max_accel_request(v_ego, launch), ACCEL_MAX)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
@@ -85,7 +92,8 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, a_target_prev, dt, acc
   if not e2e:
     if not allow_throttle:
       clipped_accel_coast = max(accel_coast, ACCEL_MIN)
-      coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
+      # the gate blends from the ceiling before D51 (A_CRUISE_GATE_LAUNCH); the lowered ceiling only caps its result
+      coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [get_max_accel(v_ego, A_CRUISE_GATE_LAUNCH), clipped_accel_coast])
       max_accel = min(max_accel, coast_limit)
 
   target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)

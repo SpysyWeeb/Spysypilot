@@ -46,7 +46,9 @@ def car_params():
 
 
 def test_blotv3_launch_envelope_respects_daily_vehicle_ceiling():
-  assert math.isclose(get_max_accel(0.0), ACCEL_MAX)
+  # D51: Chill's launch envelope at rest is 2.1 m/s^2, below the 4.0 vehicle ceiling it must respect
+  assert ACCEL_MAX == 4.0
+  assert math.isclose(get_max_accel(0.0), 2.1)
 
 
 def test_upstream_accelboost_survives_planner_and_publication():
