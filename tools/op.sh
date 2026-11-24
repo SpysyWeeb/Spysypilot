@@ -103,7 +103,8 @@ function op_check_git() {
   fi
 
   echo "Checking for git lfs files..."
-  if [[ $(file -b "$OPENPILOT_ROOT/openpilot/selfdrive/modeld/models/dmonitoring_model.onnx") == "data" ]]; then
+  local model="$OPENPILOT_ROOT/openpilot/selfdrive/modeld/models/dmonitoring_model.onnx"
+  if [[ -s "$model" && -r "$model" ]] && ! grep -aq '^version https://git-lfs.github.com/spec/v1$' "$model"; then
     echo -e " ↳ [${GREEN}✔${NC}] git lfs files found."
   else
     echo -e " ↳ [${RED}✗${NC}] git lfs files not found! Run 'git lfs pull'"
