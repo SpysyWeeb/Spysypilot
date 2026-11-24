@@ -6,6 +6,7 @@ Spysypilot daily (2026-11-23)
 * Fewer false "excessive actuation" alerts
 * Camera fixes: a rare start-up failure and a rare frame mismatch between cameras
 * Own alert sound for disengagements you cause (reverse gear, last driver monitoring warning)
+* Driver monitoring icon: the comma four's badge, as in StarPilot
 * Interface stutter and rendering fixes
 * The first start after this update takes longer while the new models compile
 
