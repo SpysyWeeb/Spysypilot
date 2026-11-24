@@ -1,3 +1,14 @@
+Spysypilot daily (2026-11-23)
+=======================
+* Big model on trial: Fairy Tale, replacing Light-speed 2
+* New small model (Cheddar), used when the big model can't run
+* New driver monitoring model (Super Leicht 2)
+* Fewer false "excessive actuation" alerts
+* Camera fixes: a rare start-up failure and a rare frame mismatch between cameras
+* Own alert sound for disengagements you cause (reverse gear, last driver monitoring warning)
+* Interface stutter and rendering fixes
+* The first start after this update takes longer while the new models compile
+
 Version 0.11.2 (2026-08-12)
 =======================
 * New driving model
