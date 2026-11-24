@@ -6,7 +6,8 @@ from opendbc.car.hyundai.values import CarControllerParams
 from opendbc.car.interfaces import ACCEL_MAX, ACCEL_MIN
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_max_accel
 from openpilot.selfdrive.locationd.helpers import Pose
-from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck, ExcessiveActuationType, MIN_EXCESSIVE_ACTUATION_COUNT
+from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck, ExcessiveActuationType, MIN_ENGAGE_BUFFER, \
+                                                    MIN_EXCESSIVE_ACTUATION_COUNT
 
 
 def test_daily_host_hyundai_and_launch_envelope_match_the_selected_ceiling():
@@ -24,13 +25,18 @@ def test_daily_host_hyundai_and_launch_envelope_match_the_selected_ceiling():
 def test_measured_acceleration_monitor_keeps_combo_ratio_and_existing_debounce(acceleration, expected):
   # Use the real message accessor and Pose representation without opening live sockets.
   sm = messaging.SubMaster.__new__(messaging.SubMaster)
-  sm.data = {s: getattr(messaging.new_message(s), s) for s in ('carControl', 'vehicleParameters')}
+  sm.data = {s: getattr(messaging.new_message(s), s) for s in ('carControl', 'controlsState', 'vehicleParameters')}
   cs = messaging.new_message('carState').carState
   cs.aEgo = acceleration
   sm['carControl'].longActive = True
   pose = Pose.from_device_motion(messaging.new_message('deviceMotion').deviceMotion)
   pose.acceleration.xyz[0] = acceleration
   monitor = ExcessiveActuationCheck()
+  # Upstream #39384: the longitudinal check only starts once longitudinal has been active for 1 s, so nothing counts
+  # in that second; after it the 2x ratio and the 0.25 s debounce are the same as before.
+  for _ in range(MIN_ENGAGE_BUFFER):
+    assert monitor.update(sm, cs, pose) is None
+  assert monitor._excessive_counter == 0
   for _ in range(MIN_EXCESSIVE_ACTUATION_COUNT):
     assert monitor.update(sm, cs, pose) is None
   assert monitor.update(sm, cs, pose) == expected
@@ -41,6 +47,7 @@ def test_measured_acceleration_monitor_keeps_combo_ratio_and_existing_debounce(a
   sm['carControl'].longActive = True
   cs.aEgo = 0.0
   if abs(acceleration) >= 2.0:
-    for _ in range(MIN_EXCESSIVE_ACTUATION_COUNT + 1):
+    # run past the engage buffer too, so it is the measurement check that keeps the counter at zero
+    for _ in range(MIN_ENGAGE_BUFFER + MIN_EXCESSIVE_ACTUATION_COUNT + 1):
       assert monitor.update(sm, cs, pose) is None
     assert monitor._excessive_counter == 0
